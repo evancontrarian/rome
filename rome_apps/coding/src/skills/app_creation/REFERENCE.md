@@ -31,7 +31,7 @@ A complete Rome app has the following root layout (not every file is required
 ├── components.json             # shadcn CLI config, for the rare copied recipe (web UI only)
 └── src/
     ├── actions/<name>/         # One directory per action
-    │   ├── action.yaml         # Public action contract
+    │   ├── action.yaml         # Action contract
     │   ├── index.ts            # Implementation
     │   └── index.test.ts       # Tests (recommended)
     ├── agents/<name>.yaml      # App-private agent definitions
@@ -187,11 +187,16 @@ name: dream                  # Action name; this is what agents call
 type: custom                 # Almost always `custom`
 description: Concise summary # The agent sees this — write it clearly
 entry: ./index.ts            # Optional; defaults to ./index.ts
+visibility: public|explicit  # Optional; defaults to public
 complexity: simple|moderate|complex   # Call cost
 speed: fast|moderate|slow
 reliability: low|medium|high
 sideEffects: read-only|write # IMPORTANT: write may trigger approval policies
 ```
+
+`public` actions enter an agent's catalog through `actions: ["*"]` or an exact
+canonical reference. `explicit` actions require the exact reference. This field
+does not restrict routines, hooks, app APIs, or calls from another action.
 
 ### `agents/<name>.yaml`
 
@@ -212,7 +217,7 @@ tools:                         # Built-in tool allowlist
   - Edit
   - Grep
   - Glob
-actions:                       # Action allowlist; "*" opens everything
+actions:                       # Action allowlist; "*" opens public actions
   - research-app:notes_create
   - system:fetch_channel_history
 allowedSubagents:              # Optional: canonical ids this agent may run through `system:summon`
@@ -926,6 +931,10 @@ See the community sample repo for full web app examples.
   `:host` when it injects the bundle into the shadow root
   (`packages/web/src/components/rome-app-host.tsx`), which is what makes an
   app-declared value beat the inherited host token.
+- A full-page app root uses `bg-[var(--app-canvas)]`; an inline chat component
+  leaves its root canvas transparent. The host maps `--background` onto
+  `--app-canvas` inside the app ShadowRoot so installed bundles that use
+  `bg-background` receive the app canvas too.
 - **Read only the tokens your own bundle supplies.** The host promises one
   thing across the shadow boundary: the theme layer, meaning color and shadow
   values, which arrive as inherited custom properties and track the live theme

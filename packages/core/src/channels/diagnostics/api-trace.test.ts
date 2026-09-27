@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "@rstest/core";
+import { afterEach, describe, expect, it, rstest } from "@rstest/core";
 import {
   configureImApiTrace,
   imApiTraceSchema,
@@ -10,6 +10,19 @@ import {
 afterEach(() => configureImApiTrace([]));
 
 describe("IM API diagnostics", () => {
+  it("honors the log level loaded after module import", async () => {
+    rstest.stubEnv("LOG_LEVEL", "error");
+    const output = rstest.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      configureImApiTrace(["discord"]);
+      expect(await traceImApi("discord", "http", {}, async () => "ok")).toBe("ok");
+      expect(output).not.toHaveBeenCalled();
+    } finally {
+      output.mockRestore();
+      rstest.unstubAllEnvs();
+    }
+  });
+
   it("validates platform selection and defaults to off", () => {
     expect(imApiTraceSchema.parse(undefined)).toEqual(["off"]);
     expect(imApiTraceSchema.parse("lark, discord")).toEqual(["lark", "discord"]);

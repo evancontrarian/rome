@@ -320,7 +320,7 @@ export const Chat = forwardRef<ChatHandle, ChatProps>(function ChatView(
   // The session's bound agent (`null` ⇒ default "main") and display name. The
   // composer renders the agent as a non-removable chip and the navbar shows the
   // name as the title; the mobile header bar (FreeGrid) reuses the same hook.
-  const { sessionName, model, pinnedAgentMention, archivedAt, pinnedAt } =
+  const { sessionName, model, reasoningEffort, pinnedAgentMention, archivedAt, pinnedAt } =
     useSessionIdentity(mainSessionId);
   // Local override so archive/unarchive from the navbar flips the read-only
   // composer immediately; `undefined` defers to the session read (`archivedAt`).
@@ -1592,7 +1592,7 @@ export const Chat = forwardRef<ChatHandle, ChatProps>(function ChatView(
         />
       ))}
       <div
-        className="@container/chat relative flex h-full overflow-hidden"
+        className="@container/chat relative flex h-full overflow-hidden bg-chat-canvas [--background:var(--chat-canvas)]"
         onDragEnter={handleDragEnter}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
@@ -1615,7 +1615,7 @@ export const Chat = forwardRef<ChatHandle, ChatProps>(function ChatView(
             </div>
           )}
 
-          <div className="z-20 flex h-12 shrink-0 items-center gap-1 border-b border-border bg-background/80 pl-4 pr-2 backdrop-blur-md supports-[backdrop-filter]:bg-background/65 max-md:hidden">
+          <div className="z-20 flex h-12 shrink-0 items-center gap-1 border-b border-border bg-chat-canvas/80 pl-4 pr-2 backdrop-blur-md supports-[backdrop-filter]:bg-chat-canvas/65 max-md:hidden">
             <div className="flex min-w-0 flex-1 items-center gap-2">
               <AgentAvatar
                 iconUrl={pinnedAgentMention?.iconUrl}
@@ -1626,7 +1626,7 @@ export const Chat = forwardRef<ChatHandle, ChatProps>(function ChatView(
               <span className="truncate text-ui text-foreground">
                 {sessionName?.trim() || pinnedAgentMention?.appLabel || t("sidebar.newChat")}
               </span>
-              <SessionModelLabel model={model} />
+              <SessionModelLabel model={model} reasoningEffort={reasoningEffort} />
               {sessionName?.trim() && pinnedAgentMention && (
                 <span className="shrink-0 truncate text-aux text-muted-foreground">
                   {pinnedAgentMention.appLabel}
