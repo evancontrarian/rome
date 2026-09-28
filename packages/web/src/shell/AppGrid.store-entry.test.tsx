@@ -15,14 +15,16 @@ rs.mock("@/hooks/use-apps", () => {
   const invalidators = { list: async () => {}, updates: async () => {} };
   return { useApps: () => ({ apps }), useInvalidateApps: () => invalidators };
 });
+// This file renders AppGrid without a QueryClientProvider; the auth snapshot
+// is a query hook, so stand in a signed-in guardian.
+rs.mock("@/lib/auth-state", () => ({
+  useAuthStateSnapshot: () => ({ bootstrap: { phase: "ready" } }),
+  hasSession: () => true,
+}));
 rs.mock("@/hooks/use-settings", () => {
   const settings = { data: undefined };
   const invalidate = async () => {};
   return { useSettings: () => settings, useInvalidateSettings: () => invalidate };
-});
-rs.mock("@/hooks/use-new-apps", () => {
-  const newApps = { newAppIds: new Set<string>(), markAppsSeen: () => {} };
-  return { useNewApps: () => newApps };
 });
 
 beforeAll(async () => {

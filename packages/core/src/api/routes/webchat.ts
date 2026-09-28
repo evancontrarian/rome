@@ -2158,6 +2158,7 @@ export function createWebchatRuntime(deps: ApiDeps): { routes: Hono; runtime: We
     return c.json({
       ...toWebchatSessionResponse(session, messageCount),
       model: runtimeSession?.model ?? null,
+      reasoningEffort: runtimeSession?.reasoningEffort ?? null,
     });
   });
 

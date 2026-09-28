@@ -771,6 +771,7 @@ describe("AgentRunner", () => {
         () =>
           forkSessionStub({
             providerThreadId: "fork-provider-thread",
+            appliedReasoningEffort: "max",
             events: (async function* (): AsyncIterable<AgentMessage> {
               yield { type: "result", content: "Fork answer" };
             })(),
@@ -795,6 +796,8 @@ describe("AgentRunner", () => {
         provider: "mock",
         providerThreadId: "fork-provider-thread",
         model: "mock-model",
+        // The branch header shows the effort its provider reported, not the model alone.
+        reasoningEffort: "max",
         status: "active",
       });
       // A fork never rewrites its parent: the source keeps its own pin.
@@ -2344,6 +2347,58 @@ describe("AgentRunner", () => {
       });
     });
 
+    it("records the effort each successful turn ran with", async () => {
+      const provider = new MockModelProvider([
+        [{ type: "result", content: "One" }],
+        [{ type: "result", content: "Two" }],
+        [{ type: "result", content: "Three" }],
+      ]);
+      const manager = createAgentSessionManager(
+        managerDeps(createTestModelResolver({ providers: [provider] })),
+        { keepAliveAcrossTurns: true },
+      );
+      const session = await manager.acquire({
+        agentName: "test-main",
+        channelThreadKey: "webchat:effort-record",
+      });
+      const repo = new SessionsRepository(testDb.db);
+
+      // No per-turn effort falls back to the agent's configured effort.
+      await collectMessages(session.sendTurn({ prompt: "One" }).events);
+      expect((await repo.findById(session.sessionId))?.reasoningEffort).toBe("high");
+
+      await collectMessages(session.sendTurn({ prompt: "Two", reasoningEffort: "xhigh" }).events);
+      expect((await repo.findById(session.sessionId))?.reasoningEffort).toBe("xhigh");
+
+      await collectMessages(session.sendTurn({ prompt: "Three", reasoningEffort: "low" }).events);
+      expect(
+        await sessionManager.findReusableSession("webchat:effort-record", "test-main"),
+      ).toMatchObject({ model: MODEL_MAP.large, reasoningEffort: "low" });
+      await manager.shutdown();
+    });
+
+    it("records the effort the provider reports it applied, in the provider's terms", async () => {
+      // Claude runs a warm session at its open-time effort and calls it `max`.
+      const provider = new MockModelProvider([[{ type: "result", content: "Done" }]]);
+      const open = provider.openSession.bind(provider);
+      provider.openSession = async (params) =>
+        Object.defineProperty(await open(params), "appliedReasoningEffort", { value: "max" });
+      const manager = createAgentSessionManager(
+        managerDeps(createTestModelResolver({ providers: [provider] })),
+        { keepAliveAcrossTurns: true },
+      );
+      const session = await manager.acquire({
+        agentName: "test-main",
+        channelThreadKey: "webchat:effort-fixed",
+      });
+
+      await collectMessages(session.sendTurn({ prompt: "Go", reasoningEffort: "xhigh" }).events);
+
+      const row = await new SessionsRepository(testDb.db).findById(session.sessionId);
+      expect(row?.reasoningEffort).toBe("max");
+      await manager.shutdown();
+    });
+
     it("keeps the model pin NULL for a session whose turns never succeed", async () => {
       const failingProvider: MockModelProvider = new MockModelProvider();
       failingProvider.run = async function* () {
@@ -2359,7 +2414,7 @@ describe("AgentRunner", () => {
       if (!start || start.type !== "turn_start") return;
 
       const row = await new SessionsRepository(testDb.db).findById(start.sessionId);
-      expect(row).toMatchObject({ provider: null, model: null });
+      expect(row).toMatchObject({ provider: null, model: null, reasoningEffort: null });
     });
 
     it("ends a user-stopped turn with turn_end status=interrupted", async () => {
@@ -2918,6 +2973,7 @@ describe("AgentRunner", () => {
           name: "demo_action",
           type: "system",
           description: "Schedule an event",
+          visibility: "explicit",
           complexity: "simple",
           speed: "fast",
           reliability: "high",
@@ -3595,7 +3651,7 @@ describe("AgentRunner", () => {
 
       expect(anthropicSessions).toHaveLength(0);
       expect(openAiSessions).toHaveLength(1);
-      expect(openAiSessions[0].model).toBe("gpt-5.6-luna");
+      expect(openAiSessions[0].model).toBe("gpt-6-luna");
       await manager.shutdown();
 
       const codexLoggedOut = {
@@ -3920,7 +3976,7 @@ describe("AgentRunner", () => {
       state.codex.solAccess = false;
       await collectMessages(session.sendTurn({ prompt: "Terra" }).events);
 
-      expect(opens.map((params) => params.model)).toEqual(["gpt-5.6-sol", "gpt-5.6-terra"]);
+      expect(opens.map((params) => params.model)).toEqual(["gpt-6-sol", "gpt-5.6-terra"]);
       expect(opens[1]).toMatchObject({
         isNewSession: false,
         providerThreadId: "codex-thread",
@@ -4150,7 +4206,7 @@ describe("AgentRunner", () => {
       });
 
       await collectMessages(session.sendTurn({ prompt: "first" }).events);
-      expect(opens.map((params) => params.model)).toEqual(["gpt-5.6-sol"]);
+      expect(opens.map((params) => params.model)).toEqual(["gpt-6-sol"]);
 
       // Sol access is lost. The pinned session must fail closed with the
       // structured error — no tier re-map to Terra, no Claude substitution.
@@ -4206,13 +4262,13 @@ describe("AgentRunner", () => {
       // the stored provider thread; the successful turn then records the pin.
       expect(opens).toHaveLength(1);
       expect(opens[0]).toMatchObject({
-        model: "gpt-5.6-sol",
+        model: "gpt-6-sol",
         isNewSession: false,
         providerThreadId: "codex-thread",
       });
       expect(await repo.findById(legacyId)).toMatchObject({
         provider: "openai",
-        model: "gpt-5.6-sol",
+        model: "gpt-6-sol",
       });
       await manager.shutdown();
     });
@@ -4511,6 +4567,7 @@ describe("AgentRunner", () => {
           name: "demo_action",
           type: "system",
           description: "Schedule an event",
+          visibility: "explicit",
           complexity: "simple",
           speed: "fast",
           reliability: "high",
@@ -4536,7 +4593,7 @@ describe("AgentRunner", () => {
       });
     });
 
-    it("expands wildcard action access to all registered agent-callable actions", async () => {
+    it("expands wildcard action access to public agent-callable actions", async () => {
       actionRegistry.register({
         config: {
           name: "demo_action",
@@ -4575,17 +4632,43 @@ describe("AgentRunner", () => {
         },
         execute: async () => ({ status: "ok", data: { ok: true } }),
       });
+      actionRegistry.register({
+        config: {
+          name: "internal_action",
+          type: "system",
+          description: "Internal app action",
+          visibility: "explicit",
+          complexity: "simple",
+          speed: "fast",
+          reliability: "high",
+          sideEffects: "write",
+        },
+        inputSchema: { properties: {} },
+        execute: async () => ({ status: "ok", data: { ok: true } }),
+      });
 
-      const provider = new MockModelProvider([[{ type: "result", content: "Done" }]]);
+      let executionWasRejected = false;
+      const provider: ModelProvider = {
+        id: "mock",
+        displayName: "mock-wildcard-actions",
+        builtinTools: new Set<string>(),
+        openSession: makeOpenSessionFromRun("mock", async function* (params) {
+          expect(params.actionCatalog.map((tool) => tool.name)).toEqual([
+            "demo_action",
+            "send_message",
+          ]);
+          await expect(params.executeAction("internal_action", {})).rejects.toThrow(
+            /Unknown action: internal_action/,
+          );
+          executionWasRejected = true;
+          yield { type: "result", content: "Done" };
+        }),
+      };
       const runner = createRunner(provider);
 
       await collectMessages(runner.run({ agentName: "test-all-actions", prompt: "Use all tools" }));
 
-      expect(provider.calls).toHaveLength(1);
-      expect(provider.calls[0].actionCatalog.map((tool) => tool.name)).toEqual([
-        "demo_action",
-        "send_message",
-      ]);
+      expect(executionWasRejected).toBe(true);
     });
 
     it("getActionCatalog reflects actions registered after the session opens (ZHA-98)", async () => {

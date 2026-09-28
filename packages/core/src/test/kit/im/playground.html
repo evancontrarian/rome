@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IM playground · Rome</title>
+<style>
+:root{color-scheme:light dark;--background:#f4f3ef;--surface:#fdfcf9;--foreground:#1a130f;--muted:#7a6857;--border:#e0d8cd;--primary:#b0421a;--on-primary:#fff;--tint:#ffead9;--danger:#ac302b;--radius:12px;font:14px/1.5 system-ui,sans-serif;color:var(--foreground);background:var(--background)}
+@media(prefers-color-scheme:dark){:root{--background:#201c19;--surface:#29241f;--foreground:#f4f3ef;--muted:#b9afa6;--border:#4e443d;--primary:#efad8f;--on-primary:#201c19;--tint:#493125;--danger:#ffaaa2}}
+*{box-sizing:border-box}body{margin:0}header{padding:24px 32px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:16px}h1{font-size:20px;font-weight:500;margin:0}h2{font-size:15px;font-weight:500;margin:0}p{margin:4px 0;color:var(--muted)}small,.meta{font-size:12px;color:var(--muted)}main{display:grid;grid-template-columns:260px minmax(320px,1fr) minmax(300px,1fr);gap:16px;padding:24px 32px;max-width:1600px;margin:auto}.panel{border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);overflow:hidden}.heading{padding:16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:8px;align-items:center}form,.settings{padding:16px}label{display:block;margin-bottom:12px}label>span{display:block;margin-bottom:4px}input,select,textarea,button{font:inherit;color:inherit;border:1px solid var(--border);border-radius:8px;background:var(--surface);padding:6px 10px}input,select,textarea{width:100%}textarea{resize:vertical;min-height:104px}button{cursor:pointer;min-height:32px}button:hover{background:var(--tint)}button:disabled{opacity:.5;cursor:default}.primary{background:var(--primary);color:var(--on-primary);border-color:transparent}.primary:hover{filter:brightness(.95);background:var(--primary)}:focus-visible{outline:2px solid var(--primary);outline-offset:2px}.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1}.messages,.calls{height:440px;overflow:auto;padding:16px}.message{max-width:90%;padding:12px;margin:0 0 12px;border:1px solid var(--border);border-radius:12px;white-space:pre-wrap;overflow-wrap:anywhere}.out{margin-left:auto;background:var(--tint)}.message .meta{display:flex;gap:8px;align-items:center;white-space:normal;margin-top:8px}.message button{font-size:12px;padding:0 8px;min-height:24px}details{border-bottom:1px solid var(--border);padding:8px 0}summary{cursor:pointer;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}#error{color:var(--danger);padding:0 32px;white-space:pre-wrap}#status{border:1px solid var(--border);padding:4px 12px;border-radius:999px}.empty{padding:48px 16px;text-align:center;color:var(--muted)}.note{padding:12px 16px;border-top:1px solid var(--border);color:var(--muted);font-size:12px}#edit-note{margin-bottom:8px}.danger{color:var(--danger)}@media(max-width:1050px){main{grid-template-columns:240px 1fr}.trace{grid-column:1/-1}.calls{height:240px}}@media(max-width:650px){header{padding:16px}main{padding:16px;grid-template-columns:1fr}.trace{grid-column:auto}.messages{height:320px}}
+</style>
+</head>
+<body>
+<header><div><h1>IM playground</h1><p>One conversation. Four platform behaviors.</p></div><span id="status" role="status">Connecting…</span></header>
+<p id="error" role="alert"></p>
+<main>
+<section class="panel"><div class="heading"><h2>Simulation</h2></div>
+<form id="configuration">
+<label><span>Platform preset</span><select id="platform"><option value="telegram">Telegram</option><option value="discord">Discord</option><option value="feishu">Feishu</option><option value="wechat">WeChat</option></select></label>
+<label><span>Streaming behavior</span><select id="mode"><option value="edit">Edit the same message</option><option value="append">Append complete chunks</option></select></label>
+<label><span>Chunk size (UTF-16 units)</span><input id="chunkSize" type="number" min="2" max="4096" required></label>
+<label><span>Characters per update</span><input id="step" type="number" min="1" max="512" required></label>
+<label><span>Update interval (ms)</span><input id="intervalMs" type="number" min="0" max="2000" required></label>
+<button type="submit" id="apply" class="primary">Apply & reset</button>
+</form>
+<div class="note">Applying a configuration clears this session. Chunk sizes are demo-driver limits; Feishu and WeChat use a conservative 1,000-unit preset.</div>
+<div class="settings"><button id="example" type="button">Load long message</button></div>
+</section>
+<section class="panel"><div class="heading"><h2>Conversation</h2><span class="meta" id="count"></span></div>
+<div id="messages" class="messages" aria-label="Conversation messages"></div>
+<form id="composer"><div id="edit-note" class="meta" hidden></div>
+<label><span>Message</span><textarea id="text" placeholder="Write a message, or load the long-message example…" maxlength="10000" required></textarea></label>
+<label><span>Fault on the next outbound request</span><select id="fault"><option value="none">None</option><option value="rate-limit">429 · rate limit for 1 second</option><option value="reject">403 · reject request</option><option value="drop">Accept message, then lose response</option></select></label>
+<div class="row"><button id="send" type="submit" class="primary">Send</button><button id="stream" type="button">Stream</button><button id="inbound" type="button">Inject incoming</button></div>
+<div class="row" style="margin-top:8px"><button id="stop" type="button" disabled>Stop after current request</button><button id="cancel-edit" type="button" hidden>Cancel edit</button></div>
+</form>
+<div class="note">Uses local protocol fixtures and real SDKs. WeChat needs an incoming message before replying. Playback is a demo driver, not Rome’s production delivery scheduler.</div>
+</section>
+<section class="panel trace"><div class="heading"><h2>API requests</h2><button id="export" type="button">Export JSON</button></div><div id="calls" class="calls" aria-label="API request timeline"></div><div class="note">Accepted means the fixture applied a mutation. It does not mean the SDK received the response. Latest 200 requests shown; reset after 1,000.</div></section>
+</main>
+<script type="module">
+const $ = (id) => document.getElementById(id);
+let state, editing, pending = false, initialized = false, rendered = "";
+function showError(error) { $("error").textContent = String(error?.message ?? error); }
+function fill(config) {
+  for (const [key, value] of Object.entries(config)) $(key).value = value;
+  $("mode").querySelector('[value="edit"]').disabled = config.platform === "wechat";
+}
+function edit(message) {
+  editing = message?.id;
+  $("edit-note").hidden = !editing;
+  $("cancel-edit").hidden = !editing;
+  $("edit-note").textContent = editing ? `Editing ${editing}` : "";
+  $("send").textContent = editing ? "Save edit" : "Send";
+  if (message) { $("text").value = message.text; $("text").focus(); }
+}
+function element(tag, text, className) { const node = document.createElement(tag); node.textContent = text; if (className) node.className = className; return node; }
+function render() {
+  const locked = pending || state.busy;
+  $("status").textContent = locked ? "Running…" : `${state.config.platform} · ready`;
+  for (const id of ["apply", "send", "stream", "inbound"]) $(id).disabled = locked;
+  $("stream").disabled ||= !!editing;
+  $("inbound").disabled ||= !!editing;
+  $("stop").disabled = !state.busy;
+  const key = JSON.stringify([state.messages, state.calls, locked, state.config]);
+  if (key === rendered) return;
+  rendered = key;
+  const messages = $("messages");
+  const atEnd = messages.scrollTop + messages.clientHeight >= messages.scrollHeight - 32;
+  messages.replaceChildren();
+  $("count").textContent = `${state.messages.length} messages`;
+  if (!state.messages.length) messages.append(element("p", "Messages appear here as the fixture accepts them.", "empty"));
+  for (const message of state.messages) {
+    const bubble = element("article", "", `message ${message.direction}`);
+    bubble.append(element("div", message.text));
+    const meta = element("div", `${message.direction === "in" ? "Incoming" : "Rome"} · ${message.id}${message.edited ? " · edited" : ""}`, "meta");
+    if (message.direction === "out" && state.config.mode === "edit") {
+      const button = element("button", "Edit"); button.type = "button"; button.disabled = locked; button.onclick = () => { edit(message); render(); }; meta.append(button);
+    }
+    bubble.append(meta); messages.append(bubble);
+  }
+  if (atEnd) messages.scrollTop = messages.scrollHeight;
+  const calls = $("calls");
+  const expanded = new Set([...calls.querySelectorAll("details[open]")].map((node) => node.dataset.key));
+  calls.replaceChildren();
+  for (const call of [...state.calls].reverse()) {
+    const detail = element("details", ""); detail.dataset.key = `${call.startedAt}:${call.path}`; detail.open = expanded.has(detail.dataset.key);
+    detail.append(element("summary", `${call.status ?? "…"} ${call.method} ${call.path}${call.dropped ? " · response lost" : call.accepted ? " · accepted" : ""}`));
+    detail.append(element("pre", JSON.stringify(call, null, 2))); calls.append(detail);
+  }
+}
+async function post(path, body) {
+  const response = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const result = await response.json(); if (!response.ok) throw new Error(result.error); return result;
+}
+async function action(path, body) {
+  pending = true; showError(""); render();
+  try { await post(path, body); }
+  catch (error) { showError(error); }
+  finally { pending = false; await refresh(); }
+}
+async function refresh() {
+  try {
+    const response = await fetch("/state"); if (!response.ok) throw new Error(`Playground unavailable (${response.status})`);
+    state = await response.json();
+    if (!initialized) { fill(state.config); initialized = true; }
+    if (state.error || state.errors.length) showError([state.error, ...state.errors].filter(Boolean).join("\n"));
+    render();
+  } catch (error) { $("status").textContent = "Disconnected"; showError(error); }
+}
+async function run(kind) {
+  if (!$("composer").reportValidity()) return;
+  await action("/run", { action: editing ? "edit" : kind, text: $("text").value, ...(editing ? { id: editing } : {}), fault: $("fault").value });
+}
+$("platform").onchange = () => fill(state.presets[$("platform").value]);
+$("configuration").onsubmit = async (event) => { event.preventDefault(); edit(); await action("/config", { platform: $("platform").value, mode: $("mode").value, chunkSize: Number($("chunkSize").value), step: Number($("step").value), intervalMs: Number($("intervalMs").value) }); };
+$("composer").onsubmit = (event) => { event.preventDefault(); void run("send"); };
+$("stream").onclick = () => run("stream");
+$("inbound").onclick = () => run("inbound");
+$("stop").onclick = () => action("/stop", {});
+$("cancel-edit").onclick = () => { edit(); render(); };
+$("example").onclick = () => { edit(); $("text").value = "Hello from Rome. 这是一条跨平台分块与流式编辑测试消息。👋\n".repeat(80); };
+$("export").onclick = () => { const url = URL.createObjectURL(new Blob([JSON.stringify(state, null, 2)], { type: "application/json" })); const link = element("a", ""); link.href = url; link.download = `im-${state.config.platform}.json`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); };
+await refresh();
+while (true) { await new Promise((resolve) => setTimeout(resolve, 250)); if (!document.hidden) await refresh(); }
+</script>
+</body></html>

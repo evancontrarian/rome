@@ -1,4 +1,4 @@
-CREATE TABLE `reply_delivery_parts` (
+CREATE TABLE IF NOT EXISTS `reply_delivery_parts` (
 	`run_id` text NOT NULL,
 	`block_ix` integer NOT NULL,
 	`part_ix` integer NOT NULL,

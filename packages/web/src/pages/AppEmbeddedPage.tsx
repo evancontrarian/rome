@@ -9,6 +9,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { useAppCatalogEvents } from "@/hooks/use-app-catalog-events";
 import { useDocumentTitle } from "@/hooks/use-document-title";
 import { serverRenderedName } from "@/lib/page-title";
+import { useRecordAppOpened } from "@/hooks/use-recent-apps";
 import { useTheme } from "@/hooks/use-theme";
 import { getActiveLocale } from "@/i18n";
 import { fetchJson } from "@/lib/fetch-json";
@@ -94,6 +95,10 @@ export default function AppEmbeddedPage() {
   const isGuardian = manifest?.bootstrap.caller?.kind === "guardian";
   useAppCatalogEvents(appId, isGuardian, refetch);
 
+  // The sidebar's Recent zone orders by this. Guardian only: a public visitor
+  // reaches this page too, and their visit is not the guardian's recent app.
+  useRecordAppOpened(appId, isGuardian);
+
   // Remount gate (#1640): RomeAppHost keys its mount lifecycle on `entryUrl`
   // (a string, value-compared) and `styleUrls` (an array, reference-compared).
   // Stabilize the styleUrls reference so a refetch that returns the same list —
@@ -154,7 +159,7 @@ export default function AppEmbeddedPage() {
   // renders through AppFullPage and never mounts it — that surface is
   // user-facing.
   return (
-    <div>
+    <div className="min-h-full bg-app-canvas">
       <RomeAppHost
         appId={manifest.appId}
         appName={manifest.appName}

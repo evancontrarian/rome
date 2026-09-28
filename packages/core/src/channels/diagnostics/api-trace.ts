@@ -20,9 +20,11 @@ export interface ImApiTraceEvent {
   durationMs?: number;
   detail: unknown;
 }
-const log = createLogger("im-api-trace");
+let log: ReturnType<typeof createLogger> | undefined;
+const defaultSink = (event: ImApiTraceEvent) =>
+  (log ??= createLogger("im-api-trace")).info("IM API trace", { event });
 let platforms: readonly string[] = [];
-let sink = (event: ImApiTraceEvent) => log.info("IM API trace", { event });
+let sink = defaultSink;
 const LIMIT = 32_768;
 const secret =
   /authorization|^auth$|cookie|token|secret|password|credential|signature|^sig$|^hm$|appsecret|context_token|encrypt|aes[_-]?key|upload_param|api[_-]?key|ticket/i;
@@ -32,7 +34,7 @@ export function configureImApiTrace(
   emit?: (event: ImApiTraceEvent) => void,
 ) {
   platforms = selected;
-  sink = emit ?? ((event) => log.info("IM API trace", { event }));
+  sink = emit ?? defaultSink;
 }
 
 function safeUrl(value: string) {
