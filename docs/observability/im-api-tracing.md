@@ -49,6 +49,6 @@ Message content and platform identifiers remain visible. Enable recording only f
 3. Replace personal content and identifiers with synthetic values. Add a scenario asserting the newly observed behavior and update the modeled route.
 4. Run `pnpm test:im` and keep only the synthetic scenario in the repository.
 
-Captures are evidence for fixture changes, not executable scripts. A future simulation UI can use the same event envelope for a request timeline and read the fixture's message state for conversation rendering. Scenario controls can call the existing event injection and fault barriers. Keep platform payloads available alongside the conversation view so the UI does not hide protocol differences.
+Captures are evidence for fixture changes, not executable scripts. The local playground reads fixture message state and recorded requests. Its scenario controls use the existing event injection and fault queue. The request payload remains available beside the conversation view.
 
-The UI is not implemented here. Raw Gateway/WebSocket frames, full reconnect replay, a capture importer, and a browser control API remain separate work. These API records alone cannot reconstruct every incoming Lark or Discord event.
+Run `pnpm dev:im` for the local [protocol playground](../../packages/core/src/test/kit/im/README.md#visual-playground). It exposes fixture state and scenario controls through a loopback-only browser interface. Raw Gateway/WebSocket capture, full reconnect replay, and a capture importer remain separate work. These API records alone cannot reconstruct every incoming Lark or Discord event.
