@@ -299,6 +299,7 @@ describe("AIToolState", () => {
     const allProbes = { codexStatus, claudeStatus, codexUsage, claudeUsage };
     const state = createAIToolState({ probes: allProbes });
     try {
+      for (const probe of Object.values(allProbes)) expect(probe).toHaveBeenCalledTimes(1);
       await state.refresh();
       for (const probe of Object.values(allProbes)) expect(probe).toHaveBeenCalledTimes(1);
 
