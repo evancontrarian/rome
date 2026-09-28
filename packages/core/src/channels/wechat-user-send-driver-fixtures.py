@@ -292,6 +292,83 @@ class SendTests(unittest.TestCase):
         self.assertFails("ambiguous", False, lambda: send(client, desk, store, clock, "wxid_li", "Li Wei"))
         self.assertEqual((client.sent, desk.events), ([], []))
 
+    def test_a_same_named_row_after_the_web_section_is_ambiguous(self):
+        client, desk, store, clock = rig()
+        on_text = client.on_text
+
+        def with_a_later_section(node):
+            on_text(node)
+            if client.pending:  # e.g. a group of that name listed after "More"
+                client.pending[1] = client.pending[1] + [("More", "header"), ("File Transfer", "local")]
+        client.on_text = with_a_later_section
+        self.assertFails("ambiguous", False, lambda: send(client, desk, store, clock))
+        self.assertEqual((client.sent, client.search.value), ([], ""))
+        self.assertNotIn("Return", desk.events)
+
+    def test_results_are_not_judged_on_the_web_suggestion_alone(self):
+        client, desk, store, clock = rig()
+        on_text, children, later, polls = client.on_text, client.list.children, [], [0]
+
+        def web_first(node):
+            on_text(node)
+            if client.pending:  # the web section shows before the local ones load
+                later.append(client.pending[1])
+                client.pending = [client.pending[0], [r for r in later[0] if r[1] != "local"][1:]]
+
+        def local_later():
+            if later and client.rows and client.rows[0][0] == "Internet search results":
+                polls[0] += 1
+                if polls[0] >= 12:  # stable well past the settle window, then the rest
+                    client.set_rows(later.pop())
+            return children()
+        client.on_text, client.list.children = web_first, local_later
+        self.assertEqual(send(client, desk, store, clock), "filehelper:1")
+
+    def test_a_same_named_row_that_loads_during_the_keys_is_ambiguous(self):
+        client, desk, store, clock = rig()
+        key = client.key
+
+        def key_then_load(name):
+            key(name)
+            if name == "Up" and client.focus is client.search:  # a late section appears
+                client.set_rows(client.rows + [("Group Chats", "header"), ("File Transfer", "local")])
+                client.cur = 1
+                for k, node in enumerate(client.list.kids):
+                    node.current = k == 1
+        client.key = key_then_load
+        self.assertFails("ambiguous", False, lambda: send(client, desk, store, clock))
+        self.assertEqual((client.sent, client.search.value), ([], ""))
+        self.assertNotIn("Return", desk.events)
+
+    def test_a_slow_send_is_confirmed_by_the_store(self):
+        client, desk, store, clock = rig()
+        key = client.key
+
+        def slow_return(name):
+            if name == "Return" and client.focus is client.input and client.input.value:
+                client.sent.append((client.input.name, client.input.value))  # sent, input not yet cleared
+                return
+            key(name)
+        client.key, store.lag = slow_return, 3
+        self.assertEqual(send(client, desk, store, clock), "filehelper:1")
+        self.assertEqual(client.all_inputs()["File Transfer"], "")  # the leftover copy is cleared
+
+    def test_a_focus_loss_at_return_leaves_no_query_in_the_search_box(self):
+        client, desk, store, clock = rig()
+        key = client.key
+
+        stolen = []
+
+        def steal_after_up(name):
+            key(name)
+            if name == "Up" and client.focus is client.search:
+                stolen.append(True)  # X focus moves before Return; the tree lags behind
+        client.key = steal_after_up
+        desk.x_active = lambda: client.active and not stolen
+        self.assertFails("focus-lost", False, lambda: send(client, desk, store, clock))
+        self.assertEqual((client.sent, client.search.value), ([], ""))
+        self.assertNotIn("Return", desk.events)
+
     def test_a_chat_history_hit_does_not_count_as_a_second_result(self):
         client, desk, store, clock = rig()
         client.results["File Transfer"] = ["File Transfer", "File Transfer\n3 related messages"]

@@ -228,15 +228,24 @@ class Driver:
         except LookupError:
             return []
 
+    @staticmethod
+    def local_hits(rows, name):
+        """Rows named `name` that may be a chat, in any section. Only the web
+        suggestion, the row right under "Internet search results", is left out.
+        Fail-closed: a same-named row anywhere else counts, so it makes the
+        choice `ambiguous` rather than opening the wrong chat."""
+        web = {r[0] + 1 for r in rows if r[2] == NONLOCAL_HEADERS[0]}
+        return [r for r in rows if r[2] == name and r[0] not in web]
+
     def settle(self, box, name):
-        """The rows once they hold one named after the query (not the recent
-        searches shown first) and have stopped changing."""
+        """The rows once they hold a local one named after the query (not the web
+        suggestion, nor the recent searches shown first) and have stopped changing."""
         seen, stable, deadline = None, 0, self.clock.time() + 6
         while self.clock.time() < deadline and FOCUSED in box.states():
             self.clock.sleep(0.3)
             rows = self.rows()
             names = [r[2] for r in rows]
-            stable = stable + 1 if name in names and names == seen else 0
+            stable = stable + 1 if self.local_hits(rows, name) and names == seen else 0
             seen = names
             if stable >= 2:
                 return rows
@@ -250,12 +259,13 @@ class Driver:
             if FOCUSED not in box.states():
                 raise Failure("focus-lost", "the search lost focus before its results settled")
             raise Failure("not-found", f"the search results for {name!r} never settled")
-        end = next((r[0] for r in rows if r[2] in NONLOCAL_HEADERS), len(rows))
-        if len([r for r in rows[:end] if r[2] == name]) > 1:
-            raise Failure("ambiguous", f"more than one local search result is named {name!r}")
+        if len(self.local_hits(rows, name)) > 1:
+            raise Failure("ambiguous", f"more than one search result is named {name!r}")
         self.key("Down", box)
         self.key("Up", box)
         rows = self.rows()
+        if len(self.local_hits(rows, name)) > 1:  # a section that loaded during the keys
+            raise Failure("ambiguous", f"more than one search result is named {name!r}")
         current = [r for r in rows if FOCUSED in r[3]]
         header = rows[0][2] if rows else None
         if len(current) != 1 or current[0][0] != 1 or current[0][2] != name or header in NONLOCAL_HEADERS:
@@ -276,10 +286,10 @@ class Driver:
         box.set_text(name)
         try:
             self.choose(box, name)
+            self.key("Return", box)
         except Failure:
             box.set_text("")
             raise
-        self.key("Return", box)
         self.clock.sleep(0.8)
         # A chat result closes the list and keeps WeChat in front. Anything else, like a
         # web search window, fails here even when the target chat was already open.
@@ -313,10 +323,15 @@ class Driver:
         self.guard("Return", box)
         self.returned = True  # from here the text may have gone out
         self.desk.key("Return")
-        self.clock.sleep(1)
-        if box.text():
-            box.set_text("")
-            raise Failure("no-echo", "Return did not send; the input was cleared", True)
+        # No verdict from the input here: a slow client can still be sending. Only the
+        # store decides, over the whole echo budget (`_send`).
+
+    def clear_leftover(self, name, body):
+        """After Return, a copy of the body still in the target's input, read name
+        last, is cleared, so the guardian cannot send it again by accident."""
+        with contextlib.suppress(Exception):
+            if self.box and self.box.text() == body and self.box.name == name:
+                self.box.set_text("")
 
     def send(self, chat_id, name, body, press_return=True):
         try:
@@ -371,8 +386,10 @@ class Driver:
             if stray:
                 raise Failure("misdelivered", f"the text landed in {stray[0]['conversationId']}", True)
             if fresh:
+                self.clear_leftover(name, body)
                 return fresh[-1]["id"]
             if self.clock.time() > deadline:
+                self.clear_leftover(name, body)
                 raise Failure("no-echo", f"no copy in the store after {ECHO_TIMEOUT_S} s; check WeChat", True)
             self.clock.sleep(1.5)
 
