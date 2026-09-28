@@ -63,21 +63,29 @@ function isAnswerable(message: InboundMessage): boolean {
 
 function connectionInbound(deps: ConnectionPortsDeps, service: string): Inbound {
   // One entry per subscription, so two subscriptions of one handler stay two.
-  const subscriptions = new Set<{ handler: (event: InboundEvent) => Promise<void> }>();
+  // Each holds the tail of its queue per conversation (R4).
+  const subscriptions = new Set<{
+    handler: (event: InboundEvent) => Promise<void>;
+    tails: Map<string, Promise<void>>;
+  }>();
   // One router subscription per Connection, fanned out to every handler. The
   // router re-attaches it across that Connection's epochs (R5).
   const attached = new Map<string, () => void>();
 
-  // Nothing upstream waits on delivery, so each handler starts on its own and
-  // none is awaited: a handler that never settles holds nothing alive (R3, R4).
+  // Each subscription hears one conversation's events one at a time, in
+  // arrival order: an event waits for that subscription's previous event in
+  // the same conversation, and for nothing else (R4). Nothing upstream waits on
+  // delivery, so dispatch returns once every event is queued.
   const dispatch = async (message: InboundMessage): Promise<void> => {
     if (!isAnswerable(message)) return;
     const event: InboundEvent = { kind: "message", message };
-    for (const { handler } of subscriptions) {
-      // Through a promise so a handler that throws before returning one still
-      // leaves the others running (R4).
-      void Promise.resolve()
-        .then(() => handler(event))
+    const conversation = message.conversationId;
+    for (const subscription of subscriptions) {
+      const previous = subscription.tails.get(conversation) ?? Promise.resolve();
+      // `then` also turns a handler that throws before returning a promise into
+      // a rejection, and the catch keeps one failure from stalling the queue.
+      const tail = previous
+        .then(() => subscription.handler(event))
         .catch((err) => {
           log.error("inbound handler threw", {
             channel: service,
@@ -85,6 +93,10 @@ function connectionInbound(deps: ConnectionPortsDeps, service: string): Inbound 
             error: err instanceof Error ? err.message : String(err),
           });
         });
+      subscription.tails.set(conversation, tail);
+      void tail.then(() => {
+        if (subscription.tails.get(conversation) === tail) subscription.tails.delete(conversation);
+      });
     }
   };
 
@@ -107,7 +119,7 @@ function connectionInbound(deps: ConnectionPortsDeps, service: string): Inbound 
 
   return {
     subscribe(handler) {
-      const subscription = { handler };
+      const subscription = { handler, tails: new Map<string, Promise<void>>() };
       subscriptions.add(subscription);
       for (const connection of deps.registry.find(service)) attach(connection.id);
       return () => {

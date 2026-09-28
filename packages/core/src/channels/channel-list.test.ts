@@ -217,6 +217,41 @@ describe("channelList", () => {
     expect(subscribed).toEqual([second.id]);
   });
 
+  it("hears one conversation's events in order, without waiting on another conversation", async () => {
+    const service = talkService("telegram");
+    const { registry, channels } = setup([service.descriptor]);
+    const inbound = channels.find((channel) => channel.name === "telegram")!.inbound!;
+    const started: string[] = [];
+    let releaseFirst!: () => void;
+    inbound.subscribe(async (event) => {
+      const id = event.message.messageId;
+      started.push(id);
+      if (id === "c1-first") {
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+        throw new Error("first fails after it is released");
+      }
+    });
+
+    const connection = await registry.connect("telegram");
+    await registry.importCredential(connection.id, "bot", {
+      material: { token: "t" },
+      expiresAt: "never",
+    });
+    const deliver = service.epochs[0]!.deliver!;
+    deliver(message({ messageId: "c1-first", conversationId: "c-1" as ConversationId }));
+    deliver(message({ messageId: "c1-second", conversationId: "c-1" as ConversationId }));
+    deliver(message({ messageId: "c2-first", conversationId: "c-2" as ConversationId }));
+
+    // c-2 is heard while c-1's first event is still in its handler.
+    await rs.waitFor(() => expect(started).toEqual(["c1-first", "c2-first"]));
+    releaseFirst();
+    // c-1's second event starts only once its first has settled, even though
+    // that one failed.
+    await rs.waitFor(() => expect(started).toEqual(["c1-first", "c2-first", "c1-second"]));
+  });
+
   it("lets no slow or synchronously throwing handler hold up another subscriber", async () => {
     const service = talkService("telegram");
     const { registry, channels } = setup([service.descriptor]);
