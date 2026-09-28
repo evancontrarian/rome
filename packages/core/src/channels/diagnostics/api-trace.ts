@@ -79,6 +79,19 @@ function sanitize(value: unknown, depth = 0, budget = { remaining: LIMIT }): unk
   }
   if (value === null || typeof value === "number" || typeof value === "boolean") return value;
   if (value === undefined) return null;
+  if (value instanceof FormData) {
+    const result: Array<{ name: string; value: unknown }> = [];
+    for (const [name, item] of value) {
+      if (result.length >= 200) break;
+      budget.remaining -= name.length + 16;
+      if (budget.remaining < 0) throw sizeLimit;
+      result.push({
+        name,
+        value: secret.test(name) ? "[redacted]" : sanitize(item, depth + 1, budget),
+      });
+    }
+    return result;
+  }
   if (value instanceof Blob)
     return { omitted: "binary", bytes: value.size, contentType: value.type };
   if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer)
@@ -89,20 +102,18 @@ function sanitize(value: unknown, depth = 0, budget = { remaining: LIMIT }): unk
     return result;
   }
   if (typeof value === "object") {
+    if (
+      !(value instanceof Headers) &&
+      !(value instanceof URLSearchParams) &&
+      Object.getPrototypeOf(value) !== Object.prototype &&
+      Object.getPrototypeOf(value) !== null
+    )
+      return { omitted: "non-JSON object" };
     const entries = function* (): Generator<[string, unknown]> {
-      if (
-        value instanceof Headers ||
-        value instanceof URLSearchParams ||
-        value instanceof FormData
-      ) {
+      if (value instanceof Headers || value instanceof URLSearchParams) {
         yield* value.entries();
         return;
       }
-      if (
-        Object.getPrototypeOf(value) !== Object.prototype &&
-        Object.getPrototypeOf(value) !== null
-      )
-        return;
       for (const key in value) {
         if (Object.hasOwn(value, key)) yield [key, (value as Record<string, unknown>)[key]];
       }
