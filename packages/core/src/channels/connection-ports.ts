@@ -7,6 +7,7 @@
 
 import type { InboundMessage, TalkRouter } from "@rome-os/app-runtime";
 import type { ConnectionRegistry } from "../connections/registry.js";
+import { KeyedMutex } from "../lib/keyed-mutex.js";
 import { createLogger } from "../logger.js";
 import type { ChannelSend, Inbound, InboundEvent } from "./channel.js";
 
@@ -63,10 +64,10 @@ function isAnswerable(message: InboundMessage): boolean {
 
 function connectionInbound(deps: ConnectionPortsDeps, service: string): Inbound {
   // One entry per subscription, so two subscriptions of one handler stay two.
-  // Each holds the tail of its queue per conversation (R4).
+  // Each has its own queue per conversation (R4).
   const subscriptions = new Set<{
     handler: (event: InboundEvent) => Promise<void>;
-    tails: Map<string, Promise<void>>;
+    conversations: KeyedMutex;
   }>();
   // One router subscription per Connection, fanned out to every handler. The
   // router re-attaches it across that Connection's epochs (R5).
@@ -85,11 +86,13 @@ function connectionInbound(deps: ConnectionPortsDeps, service: string): Inbound 
     const event: InboundEvent = { kind: "message", message };
     const conversation = message.conversationId;
     for (const subscription of subscriptions) {
-      const previous = subscription.tails.get(conversation) ?? Promise.resolve();
-      // `then` also turns a handler that throws before returning a promise into
-      // a rejection, and the catch keeps one failure from stalling the queue.
-      const tail = previous
-        .then(() => (subscriptions.has(subscription) ? subscription.handler(event) : undefined))
+      // Queued in dispatch order; a failed handler is logged and the next
+      // event in the conversation still runs.
+      subscription.conversations
+        .runExclusive(conversation, async () => {
+          if (!subscriptions.has(subscription)) return;
+          await subscription.handler(event);
+        })
         .catch((err) => {
           log.error("inbound handler threw", {
             channel: service,
@@ -97,10 +100,6 @@ function connectionInbound(deps: ConnectionPortsDeps, service: string): Inbound 
             error: err instanceof Error ? err.message : String(err),
           });
         });
-      subscription.tails.set(conversation, tail);
-      void tail.then(() => {
-        if (subscription.tails.get(conversation) === tail) subscription.tails.delete(conversation);
-      });
     }
   };
 
@@ -123,7 +122,7 @@ function connectionInbound(deps: ConnectionPortsDeps, service: string): Inbound 
 
   return {
     subscribe(handler) {
-      const subscription = { handler, tails: new Map<string, Promise<void>>() };
+      const subscription = { handler, conversations: new KeyedMutex() };
       subscriptions.add(subscription);
       for (const connection of deps.registry.find(service)) attach(connection.id);
       return () => {

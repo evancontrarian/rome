@@ -10,8 +10,17 @@ import type {
 import type { Connection, ConnectionId } from "./types.js";
 import type { ConnectionRegistry } from "./registry.js";
 import { createLogger } from "../logger.js";
+import { KeyedMutex } from "../lib/keyed-mutex.js";
 
 const log = createLogger("talk-router");
+
+/** Decides whether a subscriber may hear an inbound message (pairing). */
+type Admission = (
+  connectionId: string,
+  service: string,
+  message: InboundMessage,
+  router: TalkRouter,
+) => Promise<boolean>;
 
 export class ConnectionTalkRouter implements TalkRouter {
   private readonly handlers = new Map<
@@ -21,17 +30,12 @@ export class ConnectionTalkRouter implements TalkRouter {
 
   private readonly attached = new Map<ConnectionId, () => void>();
 
-  /** The last admission still running per connection and conversation. */
-  private readonly admissions = new Map<string, Promise<unknown>>();
+  /** Admits one message at a time per connection and conversation. */
+  private readonly admissions = new KeyedMutex();
 
   constructor(
     private readonly registry: ConnectionRegistry,
-    private readonly admit?: (
-      connectionId: string,
-      service: string,
-      message: InboundMessage,
-      router: TalkRouter,
-    ) => Promise<boolean>,
+    private readonly admit?: Admission,
   ) {
     registry.onUnlocked("talk", (connection) => this.attach(connection));
   }
@@ -99,32 +103,41 @@ export class ConnectionTalkRouter implements TalkRouter {
     const previous = this.attached.get(connection.id);
     previous?.();
     const detach = talk.subscribe(async (message) => {
-      if (this.admit && !(await this.admitInOrder(connection, message))) return;
-      await Promise.all(
-        [...(this.handlers.get(connection.id) ?? [])].map((handler) => handler(message)),
-      );
+      if (!this.admit) {
+        await this.startHandlers(connection.id, message);
+        return;
+      }
+      const started = await this.admitInOrder(connection, message, this.admit);
+      if (started) await started.handled;
     });
     this.attached.set(connection.id, detach);
   }
 
   /** Admission awaits the database, and pooled queries can finish in either
-   *  order. Each message's admission starts after the previous one in its
-   *  conversation settles, so handlers hear a conversation in arrival order.
+   *  order. Each message's admission waits for the previous one in its
+   *  conversation, and an admitted message's handlers start before the next
+   *  admission begins, so handlers hear a conversation in arrival order.
    *  An admission therefore holds up its conversation's next message for as
    *  long as it runs; pairing admission waits only on its reads and sends its
-   *  replies in the background. */
-  private admitInOrder(connection: Connection, message: InboundMessage): Promise<boolean> {
-    const admit = this.admit;
-    if (!admit) return Promise.resolve(true);
+   *  replies in the background. The handlers' completion is returned inside an
+   *  object so the conversation is released once they start, not once they
+   *  finish. */
+  private admitInOrder(
+    connection: Connection,
+    message: InboundMessage,
+    admit: Admission,
+  ): Promise<{ handled: Promise<unknown> } | null> {
     const key = `${connection.id}\0${message.conversationId}`;
-    const previous = this.admissions.get(key) ?? Promise.resolve();
-    const admitted = previous.then(() => admit(connection.id, connection.service, message, this));
-    const settled = admitted.catch(() => {});
-    this.admissions.set(key, settled);
-    void settled.then(() => {
-      if (this.admissions.get(key) === settled) this.admissions.delete(key);
+    return this.admissions.runExclusive(key, async () => {
+      if (!(await admit(connection.id, connection.service, message, this))) return null;
+      return { handled: this.startHandlers(connection.id, message) };
     });
-    return admitted;
+  }
+
+  private startHandlers(connectionId: ConnectionId, message: InboundMessage): Promise<unknown> {
+    return Promise.all(
+      [...(this.handlers.get(connectionId) ?? [])].map((handler) => handler(message)),
+    );
   }
 
   private requireTalk(connectionId: string) {
