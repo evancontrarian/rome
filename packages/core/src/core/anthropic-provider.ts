@@ -735,15 +735,50 @@ export class AnthropicProvider implements ModelProvider {
             }
           } else if (isResultMessage(message)) {
             const echoed = echoedSendIds(message).filter((id) => romeSendIds.has(id));
+            const ownerAtResult = sdkTurnOwner;
             sdkTurnOwner = undefined;
-            // Results of turns the SDK started for a finished background task
-            // answer none of Rome's sends. They end no Rome turn.
-            if (echoed.length === 0 && message.origin?.kind === "task-notification") {
+            // A result follows the owner its frames were routed to. A turn with
+            // no frames (the empty results of a resumed or batched background
+            // task) is the SDK's own when its origin says so.
+            const sdkOwned =
+              echoed.length === 0 &&
+              ownerAtResult !== "rome" &&
+              (ownerAtResult === "sdk" || message.origin?.kind === "task-notification");
+            if (sdkOwned) {
+              // It ends no Rome turn, but it spent real model calls and can hit
+              // account errors, so it keeps those side effects.
+              const accounting = buildAnthropicAccounting(
+                message,
+                effectiveModel,
+                providerId,
+                undefined,
+              );
               log.info("SDK-initiated turn ended outside any Rome turn", {
                 subtype: message.subtype,
                 numTurns: message.num_turns,
-                result: isResultSuccess(message) ? message.result.slice(0, 200) : undefined,
+                costUsd: accounting?.costUsd,
+                resultLength: isResultSuccess(message) ? message.result.length : undefined,
               });
+              if (isResultSuccess(message)) {
+                if (message.num_turns > 0) {
+                  recordModelCallMetrics(effectiveModel, accounting, message, {
+                    agentName: params.agentName,
+                    appStoreListingId: params.appStoreListingId,
+                  });
+                  void clearAnthropicAuthRevoked(authRevokedSource).catch(() => {});
+                }
+              } else {
+                const errors = message.errors ?? [];
+                const errorText = errors.join("; ");
+                if (isAnthropicUsageLimitError(errors) || isAnthropicUsageLimitError(errorText)) {
+                  onQuotaExhausted?.();
+                } else if (
+                  isAnthropicAuthRevokedError(errors) ||
+                  isAnthropicAuthRevokedError(errorText)
+                ) {
+                  await persistAnthropicAuthRevoked(authRevokedSource, onAuthRevoked);
+                }
+              }
               continue;
             }
             for (const id of echoed) {

@@ -374,6 +374,92 @@ describe("AnthropicProvider", () => {
       ]);
     });
 
+    it("routes an SDK-started turn's result by its frames, whatever its origin", async () => {
+      scripted(async function* (sent) {
+        const first = await sent();
+        yield { ...first, isReplay: true };
+        yield say("DONE", first.uuid);
+        yield result("DONE", [first.uuid], "human");
+        const second = await sent();
+        // The SDK runs a turn of its own first; its result carries no origin.
+        yield say("Noted the finished task.");
+        yield result("Noted the finished task.", []);
+        yield { ...second, isReplay: true };
+        yield say("PONG", second.uuid);
+        yield result("PONG", [second.uuid], "human");
+      });
+      const session = await new AnthropicProvider().openSession(buildParams());
+      const events = session.events[Symbol.asyncIterator]();
+      await session.sendUserInput({ text: "start it", inputId: a });
+      await nextTurn(events);
+      await session.sendUserInput({ text: "Reply with PONG.", inputId: p });
+      const second = await nextTurn(events);
+      await session.close();
+
+      expect(second.at(-1)).toMatchObject({ type: "result", content: "PONG" });
+      expect(second.filter((m) => m.type === "text")).toEqual([
+        { type: "text", content: "PONG", turnPhase: "final" },
+      ]);
+    });
+
+    it("ends a Rome turn whose result echoes nothing but follows its frames", async () => {
+      scripted(async function* (sent) {
+        const first = await sent();
+        yield { ...first, isReplay: true };
+        yield say("Working.", first.uuid);
+        yield {
+          type: "result",
+          subtype: "error_during_execution",
+          errors: ["stream closed"],
+          num_turns: 2,
+          stop_reason: null,
+          total_cost_usd: 0,
+          duration_ms: 1,
+          origin: { kind: "task-notification" },
+        };
+      });
+      const session = await new AnthropicProvider().openSession(buildParams());
+      await session.sendUserInput({ text: "work", inputId: a });
+      const turn = await nextTurn(session.events[Symbol.asyncIterator]());
+      await session.close();
+
+      expect(turn.at(-1)).toMatchObject({ type: "error", error: "stream closed" });
+    });
+
+    it("keeps an SDK-started turn's account errors without ending a Rome turn", async () => {
+      let quotaMarked = false;
+      scripted(async function* (sent) {
+        const first = await sent();
+        yield { ...first, isReplay: true };
+        yield say("DONE", first.uuid);
+        yield result("DONE", [first.uuid], "human");
+        yield say("Checking the task.");
+        yield {
+          type: "result",
+          subtype: "error_during_execution",
+          errors: ["Claude usage limit reached. Please try again later."],
+          num_turns: 1,
+          stop_reason: "error",
+          total_cost_usd: 0,
+          duration_ms: 1,
+          origin: { kind: "task-notification" },
+        };
+      });
+      const session = await new AnthropicProvider({
+        onQuotaExhausted: () => {
+          quotaMarked = true;
+        },
+      }).openSession(buildParams());
+      await session.sendUserInput({ text: "start it", inputId: a });
+      const events = await collectEvents(session);
+      await session.close();
+
+      expect(quotaMarked).toBe(true);
+      expect(events.filter((m) => m.type === "result" || m.type === "error")).toEqual([
+        expect.objectContaining({ type: "result", content: "DONE" }),
+      ]);
+    });
+
     it("stamps sends without an inputId and reports no input status for them", async () => {
       const sends: { uuid?: string; origin?: unknown }[] = [];
       scripted(async function* (sent) {
@@ -432,6 +518,7 @@ describe("AnthropicProvider", () => {
         uuid: "assistant-structured",
         session_id: "claude-structured",
         parent_tool_use_id: null,
+        user_message_uuid: SENT,
         message: { content: [{ type: "text", text: JSON.stringify(structuredOutput) }] },
       },
       {
@@ -449,7 +536,7 @@ describe("AnthropicProvider", () => {
     const session = await new AnthropicProvider().openSession(
       buildParams({ outputSchema: schema }),
     );
-    await session.sendUserInput({ text: "return seven" });
+    await session.sendUserInput({ text: "return seven", inputId: SENT });
     const events = await collectEvents(session);
 
     expect(queryMock.mock.calls[0]![0].options.outputFormat).toEqual({
