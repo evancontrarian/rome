@@ -252,6 +252,36 @@ describe("channelList", () => {
     await rs.waitFor(() => expect(started).toEqual(["c1-first", "c2-first", "c1-second"]));
   });
 
+  it("drops events still queued for a handler once it unsubscribes", async () => {
+    const service = talkService("telegram");
+    const { registry, channels } = setup([service.descriptor]);
+    const inbound = channels.find((channel) => channel.name === "telegram")!.inbound!;
+    const started: string[] = [];
+    let releaseFirst!: () => void;
+    const unsubscribe = inbound.subscribe(async (event) => {
+      started.push(event.message.messageId);
+      if (event.message.messageId === "held") {
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+      }
+    });
+
+    const connection = await registry.connect("telegram");
+    await registry.importCredential(connection.id, "bot", {
+      material: { token: "t" },
+      expiresAt: "never",
+    });
+    service.epochs[0]!.deliver?.(message({ messageId: "held" }));
+    service.epochs[0]!.deliver?.(message({ messageId: "queued" }));
+    await rs.waitFor(() => expect(started).toEqual(["held"]));
+
+    unsubscribe();
+    releaseFirst();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(started).toEqual(["held"]);
+  });
+
   it("lets no slow or synchronously throwing handler hold up another subscriber", async () => {
     const service = talkService("telegram");
     const { registry, channels } = setup([service.descriptor]);

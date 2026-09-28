@@ -72,10 +72,12 @@ function connectionInbound(deps: ConnectionPortsDeps, service: string): Inbound 
   // router re-attaches it across that Connection's epochs (R5).
   const attached = new Map<string, () => void>();
 
-  // Each subscription hears one conversation's events one at a time, in
-  // arrival order: an event waits for that subscription's previous event in
-  // the same conversation, and for nothing else (R4). Nothing upstream waits on
-  // delivery, so dispatch returns once every event is queued.
+  // Each subscription hears one conversation's events one at a time, in the
+  // order they are dispatched here: an event waits for that subscription's
+  // previous event in the same conversation, and for nothing else (R4).
+  // Nothing upstream waits on delivery, so dispatch returns once every event
+  // is queued. An event still queued when its subscription ends is dropped
+  // (R3), so a replaced subscriber never answers after its successor starts.
   const dispatch = async (message: InboundMessage): Promise<void> => {
     if (!isAnswerable(message)) return;
     const event: InboundEvent = { kind: "message", message };
@@ -85,7 +87,7 @@ function connectionInbound(deps: ConnectionPortsDeps, service: string): Inbound 
       // `then` also turns a handler that throws before returning a promise into
       // a rejection, and the catch keeps one failure from stalling the queue.
       const tail = previous
-        .then(() => subscription.handler(event))
+        .then(() => (subscriptions.has(subscription) ? subscription.handler(event) : undefined))
         .catch((err) => {
           log.error("inbound handler threw", {
             channel: service,
