@@ -1,5 +1,6 @@
 import "./styles.css";
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { fetchAppApi, type RomeAppBootstrap } from "@rome-os/app-web-sdk";
 import { CircleAlert, LayoutTemplate, TriangleAlert } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@rome-os/ui/alert";
@@ -38,47 +39,41 @@ interface AppStatus {
   status: string;
 }
 
-// The UI stays current on its own: refetch on an interval and when the tab
-// becomes visible again. A failed update keeps the last good data on screen.
-const REFRESH_INTERVAL_MS = 30_000;
+// Every query stays current without the guardian asking: it refetches on an
+// interval while the page is visible and again when the tab regains focus. A
+// failed refetch keeps the last good data, so the UI can show it with a warning.
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      refetchInterval: 30_000,
+      refetchOnWindowFocus: true,
+    },
+  },
+});
+
+async function fetchStatus(): Promise<AppStatus> {
+  const response = await fetchAppApi("status");
+  if (!response.ok) {
+    throw new Error(`Status request failed (${response.status})`);
+  }
+  return (await response.json()) as AppStatus;
+}
 
 export default function App({ bootstrap: _bootstrap }: { bootstrap: RomeAppBootstrap }) {
-  const [status, setStatus] = useState<AppStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  return (
+    <QueryClientProvider client={queryClient}>
+      <AppPage />
+    </QueryClientProvider>
+  );
+}
+
+function AppPage() {
   const [defaultView, setDefaultView] = useState("overview");
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadStatus(): Promise<void> {
-      try {
-        const response = await fetchAppApi("status");
-        if (!response.ok) {
-          throw new Error(`Status request failed (${response.status})`);
-        }
-        const data = (await response.json()) as AppStatus;
-        if (cancelled) return;
-        setStatus(data);
-        setError(null);
-      } catch (err: unknown) {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : String(err));
-      }
-    }
-
-    function refreshIfVisible(): void {
-      if (document.visibilityState === "visible") void loadStatus();
-    }
-
-    void loadStatus();
-    const timer = window.setInterval(refreshIfVisible, REFRESH_INTERVAL_MS);
-    document.addEventListener("visibilitychange", refreshIfVisible);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", refreshIfVisible);
-    };
-  }, []);
+  const { data: status, error: queryError } = useQuery({
+    queryKey: ["status"],
+    queryFn: fetchStatus,
+  });
+  const error = queryError?.message ?? null;
 
   return (
     <Page className="min-h-full bg-[var(--app-canvas)]">

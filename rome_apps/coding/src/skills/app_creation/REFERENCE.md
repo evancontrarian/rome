@@ -955,6 +955,7 @@ See the community sample repo for full web app examples.
   control scale (`--control-*` / `--field-*`) and its `Portal` to
   `getPortalContainer()`.
 - Icons: `lucide-react` is already a runtime dependency (and the kit's peer).
+- Server data: `@tanstack/react-query` is already a runtime dependency. Read app API data with `useQuery` under the template's `QueryClient`, whose defaults refetch on an interval while the page is visible and on tab focus. Do not hand-roll `useEffect` fetches or polling timers.
 
 ### Shadow DOM & Input Behaviour
 
