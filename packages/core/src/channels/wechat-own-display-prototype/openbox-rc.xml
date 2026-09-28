@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- PROTOTYPE, round 4. Openbox for WeChat's own display (:100).
+     No key bindings at all, so no key typed on this display ever becomes a
+     window-manager action. Click to focus. WeChat's main window is maximized
+     and undecorated; its login window has a fixed size, which openbox keeps. -->
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <focus>
+    <focusNew>yes</focusNew>
+    <followMouse>no</followMouse>
+  </focus>
+  <placement>
+    <policy>Smart</policy>
+    <center>yes</center>
+  </placement>
+  <desktops>
+    <number>1</number>
+  </desktops>
+  <keyboard>
+  </keyboard>
+  <mouse>
+    <context name="Client">
+      <mousebind button="Left" action="Press">
+        <action name="Focus"/>
+        <action name="Raise"/>
+      </mousebind>
+    </context>
+  </mouse>
+  <applications>
+    <application class="wechat" type="normal">
+      <decor>no</decor>
+      <maximized>yes</maximized>
+      <focus>yes</focus>
+    </application>
+  </applications>
+</openbox_config>
