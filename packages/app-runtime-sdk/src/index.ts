@@ -1577,7 +1577,6 @@ export interface TalkDeliveryProfile {
   maxPendingBytes: number;
   maxQueuedOperations: number;
   formatting: "plain" | "native";
-  formattingFallback: boolean;
 }
 
 /** Text mutations address owned physical messages, independently of interaction cards. */

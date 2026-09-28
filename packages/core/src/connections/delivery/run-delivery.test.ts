@@ -25,7 +25,6 @@ const profile: DeliveryProfile = {
   maxPendingBytes: 10000,
   maxQueuedOperations: 100,
   formatting: "plain",
-  formattingFallback: true,
 };
 
 function setup(overrides: Partial<TextTransport> = {}) {

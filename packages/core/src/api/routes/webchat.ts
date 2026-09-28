@@ -2713,8 +2713,7 @@ export function createWebchatRuntime(deps: ApiDeps): { routes: Hono; runtime: We
           resolver: appResolver,
         });
         let queue = Promise.resolve();
-        let assistantText = "";
-        let assistantBlockIx = 0;
+        const textAssembly = new AssistantTextAssembler();
         let terminalError: Extract<StreamAgentMessage, { type: "error" }> | undefined;
         let interrupted = false;
         const write = (event: WebchatEventName, data: unknown) => {
@@ -2726,17 +2725,21 @@ export function createWebchatRuntime(deps: ApiDeps): { routes: Hono; runtime: We
             return;
           }
           if (message.type === "text_delta") {
-            assistantText += message.content;
+            const snapshot = textAssembly.append(message.content, message.blockId);
             write("assistant_text", {
               turnId,
-              blockIx: assistantBlockIx,
-              text: assistantText,
+              blockIx: snapshot.blockIx,
+              text: snapshot.content,
             });
             return;
           }
           if (message.type === "text") {
-            assistantText = "";
-            assistantBlockIx += 1;
+            const snapshot = textAssembly.complete(
+              message.content,
+              message.turnPhase,
+              message.blockId,
+            );
+            write("assistant_text", { turnId, blockIx: snapshot.blockIx, text: snapshot.content });
           }
           if (message.type === "error") terminalError = message;
           if (message.type === "turn_end" && message.status === "interrupted") interrupted = true;

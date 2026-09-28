@@ -10,6 +10,38 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 describe("IM delivery adapters through local protocol peers", () => {
+  it("retries Discord reads after a server error without replaying message creates", async () => {
+    const fixture = await new DiscordApiFixture().start();
+    const adapter = fixture.createAdapter();
+    try {
+      await adapter.start();
+      fixture.server.once({
+        method: "GET",
+        path: `/api/v10/channels/${DISCORD_DM}`,
+        response: { status: 503 },
+      });
+      const receipt = await adapter.createText(DISCORD_DM, "once");
+      expect(receipt.messageId).toBeTruthy();
+      const reads = fixture.server.calls.filter(
+        (call) => call.method === "GET" && call.path === `/api/v10/channels/${DISCORD_DM}`,
+      );
+      expect(reads.map((call) => call.status)).toEqual([503, 200]);
+      fixture.server.once({
+        method: "POST",
+        path: `/api/v10/channels/${DISCORD_DM}/messages`,
+        dropAfterAccept: true,
+      });
+      await expect(adapter.createText(DISCORD_DM, "ambiguous")).rejects.toMatchObject({
+        kind: "unknown",
+      });
+      expect(fixture.messages.size).toBe(2);
+      fixture.server.assertClean();
+    } finally {
+      await adapter.stop();
+      await fixture.close();
+    }
+  });
+
   it("keeps Feishu API refusal and unknown acceptance distinct without SDK retries", async () => {
     const fixture = await new LarkApiFixture().start();
     const adapter = fixture.createAdapter();

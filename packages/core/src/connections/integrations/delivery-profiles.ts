@@ -12,7 +12,6 @@ const defaults = {
   maxPendingBytes: 1024 * 1024,
   maxQueuedOperations: 256,
   formatting: "plain",
-  formattingFallback: true,
 } as const;
 
 export function telegramDeliveryProfile(budgetKey: string): DeliveryProfile {

@@ -12,6 +12,30 @@ pnpm test:im
 
 The files use `.integration.test.ts`, so `pnpm test:integration` and its CI job include them. Fast unit tests remain in the unit suite.
 
+## Delivery playground
+
+Run `pnpm dev:all`, then `./r pnpm dev:im` in another terminal. Open `/dev/im`
+on the dashboard development origin. The dev server proxies `/__im` to the
+loopback fixture service on port 3211 in the same container. For host-only
+frontend debugging, run `pnpm dev:im` on the host alongside the web dev server.
+Production builds omit the page and do not start or load the fixture service.
+
+The page configures one shared, temporary conversation per service process.
+Applying a configuration closes its connections and resets its database and
+message state. Incoming messages travel through the real adapter, connection
+registry and TalkRouter subscriber into the conversation repository. Ordinary
+sends use TalkRouter.send. Scripted model deltas use RunDelivery, its scheduler
+and SQLite receipt repository. Platform pacing stays at the production profile
+defaults. The delta interval controls generation, not the platform request rate.
+Inject an incoming message first on WeChat to establish its context token.
+
+The same text can be delivered as edited previews, complete chunks or final-only
+output. Faults affect the next create request at the fixture HTTP boundary.
+Stop cancels the active run while retaining already accepted messages and
+receipts. The timeline shows the last 200 redacted requests. Reset after 1,000
+requests. This surface scripts text generation; it does not invoke a live model
+or prove live-account permissions and provider quotas.
+
 ## Supported contracts
 
 | Fixture | Real client | Modeled protocol |

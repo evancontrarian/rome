@@ -1,3 +1,4 @@
+import type { TalkDeliveryProfile } from "@rome-os/app-runtime";
 import { z } from "zod";
 
 export const deliveryProfileSchema = z
@@ -16,9 +17,8 @@ export const deliveryProfileSchema = z
     maxPendingBytes: z.number().int().positive(),
     maxQueuedOperations: z.number().int().positive(),
     formatting: z.enum(["plain", "native"]),
-    formattingFallback: z.boolean(),
   })
-  .strict();
+  .strict() satisfies z.ZodType<TalkDeliveryProfile>;
 
 export type DeliveryProfile = z.infer<typeof deliveryProfileSchema>;
 

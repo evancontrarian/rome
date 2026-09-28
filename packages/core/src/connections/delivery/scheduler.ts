@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import type { DeliveryProfile } from "./profile.js";
 import { DeliveryFailure } from "./transport.js";
 import { scheduledPhysicalOperation } from "./physical-operation.js";
@@ -7,6 +8,8 @@ interface Work {
   kind: "create" | "update";
   profile: DeliveryProfile;
   execute(): Promise<void>;
+  signal?: AbortSignal;
+  cancelled: Promise<void>;
 }
 
 interface Budget {
@@ -26,8 +29,7 @@ export class DeliveryScheduler {
 
   constructor(
     private readonly now = () => Date.now(),
-    private readonly sleep = (ms: number) =>
-      new Promise<void>((resolve) => setTimeout(resolve, ms)),
+    private readonly sleep = (ms: number, signal?: AbortSignal) => delay(ms, undefined, { signal }),
   ) {}
 
   run<T>(
@@ -58,9 +60,14 @@ export class DeliveryScheduler {
     }
     return new Promise<T>((resolve, reject) => {
       let inFlight = false;
+      let releaseWait!: () => void;
+      const cancelled = new Promise<void>((resolve) => {
+        releaseWait = resolve;
+      });
       const queue = owner.queues.get(conversation) ?? [];
       const abort = () => {
         if (inFlight) return;
+        releaseWait();
         const waiting = owner.queues.get(conversation);
         if (waiting) {
           const position = waiting.indexOf(work);
@@ -72,6 +79,8 @@ export class DeliveryScheduler {
       };
       const work: Work = {
         conversation,
+        signal,
+        cancelled,
         kind,
         profile,
         execute: async () => {
@@ -123,7 +132,15 @@ export class DeliveryScheduler {
           budget.routes.get(routeKey) ?? 0,
           budget.tokens > 0 ? 0 : budget.replenishedAt + spacing,
         );
-        if (ready > this.now()) await this.sleep(ready - this.now());
+        // Cancelled waits release the shared writer without consuming rate-limit capacity.
+        if (ready > this.now()) {
+          try {
+            await Promise.race([this.sleep(ready - this.now(), work.signal), work.cancelled]);
+          } catch (error) {
+            if (!work.signal?.aborted) throw error;
+          }
+        }
+        if (work.signal?.aborted) continue;
         budget.tokens = Math.max(0, budget.tokens - 1);
         if (budget.tokens === 0) budget.replenishedAt = this.now();
         budget.conversations.set(key, this.now() + profile.conversationSpacingMs);

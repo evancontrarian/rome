@@ -20,7 +20,6 @@ const profile = resolveDeliveryProfile(
     maxPendingBytes: 1000,
     maxQueuedOperations: 100,
     formatting: "plain",
-    formattingFallback: true,
   },
   {},
   true,
@@ -102,6 +101,61 @@ describe("DeliveryScheduler", () => {
       release();
       await active;
     }
+  });
+
+  it("releases a cancelled pacing wait without charging another conversation", async () => {
+    let waiting!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      waiting = resolve;
+    });
+    const scheduler = new DeliveryScheduler(
+      () => 0,
+      async () => {
+        waiting();
+        await new Promise<void>(() => {});
+      },
+    );
+    const paced = {
+      ...profile,
+      burstCapacity: 3,
+      conversationSpacingMs: 10000,
+      createSpacingMs: 0,
+    };
+    await scheduler.run(
+      paced,
+      "a",
+      "create",
+      () => {},
+      async () => {},
+    );
+    const controller = new AbortController();
+    const stopped = scheduler.run(
+      paced,
+      "a",
+      "create",
+      () => {},
+      async () => {
+        throw new Error("cancelled work executed");
+      },
+      controller.signal,
+    );
+    const rejection = expect(stopped).rejects.toThrow("stopped");
+    await entered;
+    controller.abort();
+    await rejection;
+    const sent: string[] = [];
+    for (const conversation of ["b", "c"]) {
+      await scheduler.run(
+        paced,
+        conversation,
+        "create",
+        () => {},
+        async () => {
+          sent.push(conversation);
+        },
+      );
+    }
+    expect(sent).toEqual(["b", "c"]);
   });
 
   it("replenishes a depleted burst budget after idle time", async () => {

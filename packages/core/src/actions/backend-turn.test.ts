@@ -21,7 +21,12 @@ describe("backend turn delivery", () => {
       subscribe: () => () => {},
       feature: () => null,
     } as TalkRouter;
+    const recordOutboundMessage = rs.fn(async () => {});
     const runner = createBackendTurnRunner({
+      conversations: {
+        ensureChannelConversation: async () => ({ id: "session" }),
+        recordOutboundMessage,
+      } as unknown as ConversationRepository,
       agentRunner: createMockAgentRunner([]),
       talkRouter: router,
       async createRunDelivery(_params, turnId) {
@@ -82,6 +87,15 @@ describe("backend turn delivery", () => {
     expect(visible).toEqual([fail ? "part" : "answer"]);
     expect(owner?.terminal).toBe(true);
     expect(router.send).not.toHaveBeenCalled();
+    expect(recordOutboundMessage).toHaveBeenCalledTimes(fail ? 0 : 1);
+    if (!fail)
+      expect(recordOutboundMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          turnId: "approval-run",
+          platformMessageId: "one",
+          content: JSON.stringify([{ type: "text", content: "answer" }]),
+        }),
+      );
   });
   it("records the provider delivery id for a messaging-channel continuation", async () => {
     const agentRunner = createMockAgentRunner([

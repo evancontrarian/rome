@@ -26,7 +26,13 @@ import {
   type AutocompleteInteraction,
 } from "discord.js";
 import { chatStopReceipt, isStopCommand } from "@rome-os/app-runtime";
-import type { APIRequest, RateLimitData, RequestMethod, ResponseLike } from "discord.js";
+import type {
+  RESTOptions,
+  APIRequest,
+  RateLimitData,
+  RequestMethod,
+  ResponseLike,
+} from "discord.js";
 import { isCoreMainAgentId } from "../apps/artifact-id.js";
 import {
   filterChannelApiResponseHeaders,
@@ -325,6 +331,29 @@ export interface DiscordAdapterLike {
   executeApiRequest(request: ChannelApiRequest): Promise<ChannelApiResult>;
 }
 
+// SDK retry configuration applies to the whole manager. Only reads are safe to replay
+// after an ambiguous response; keep mutations and 429 handling in the SDK's queue.
+function retryDiscordReads(request: RESTOptions["makeRequest"]): RESTOptions["makeRequest"] {
+  return async (url, init) => {
+    const retries = String(init.method).toUpperCase() === "GET" ? 3 : 0;
+    for (let attempt = 0; ; attempt++) {
+      init.signal?.throwIfAborted();
+      try {
+        const response = await request(url, init);
+        if (response.status < 500 || response.status >= 600 || attempt === retries) return response;
+        await response.arrayBuffer();
+      } catch (error) {
+        const failure = error as { code?: string; cause?: { code?: string } };
+        if (
+          attempt === retries ||
+          (failure?.code !== "ECONNRESET" && failure?.cause?.code !== "ECONNRESET")
+        )
+          throw error;
+      }
+    }
+  };
+}
+
 export class DiscordAdapter implements ProviderAdapter {
   readonly channelName = "discord";
   private client: Client;
@@ -408,10 +437,12 @@ export class DiscordAdapter implements ProviderAdapter {
       userAgentAppendix: "Rome Discord broker/1",
       retries: 0,
     }).setToken(config.botToken);
-    this.client.rest.options.makeRequest = traceDiscordRequest(
-      this.client.rest.options.makeRequest,
+    this.client.rest.options.makeRequest = retryDiscordReads(
+      traceDiscordRequest(this.client.rest.options.makeRequest),
     );
-    this.rest.options.makeRequest = traceDiscordRequest(this.rest.options.makeRequest);
+    this.rest.options.makeRequest = retryDiscordReads(
+      traceDiscordRequest(this.rest.options.makeRequest),
+    );
   }
 
   private _botToken: string;

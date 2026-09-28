@@ -16,6 +16,7 @@ import { PersonMappingRepository } from "../../../db/repositories/person-mapping
 import { ReplyDeliveryRepository } from "../../../db/repositories/reply-delivery.js";
 import { SettingsRepository } from "../../../db/repositories/settings.js";
 import { replyDeliveryParts } from "../../../db/schema.js";
+import type { RunDelivery } from "../../../connections/delivery/run-delivery.js";
 import type { DeliveryProfile } from "../../../connections/delivery/profile.js";
 import { LarkApiFixture, LARK_CHAT } from "./lark.js";
 import { WechatApiFixture, WECHAT_ORIGIN, WECHAT_USER } from "./wechat.js";
@@ -80,16 +81,21 @@ async function deliveryStack(
   if (fixture instanceof LarkApiFixture) await fixture.untilConnected();
   else await fixture.untilPolling();
   const path = { feishu: "/open-apis/im/v1/messages", wechat: "/ilink/bot/sendmessage" }[platform];
+  const runs: RunDelivery[] = [];
   return {
     fixture,
     test,
     path,
     configure: (overrides: unknown) =>
       settings.set(`connection_delivery:${connection.id}`, overrides),
-    run: (id: string) =>
-      router.createRunDelivery(connection.id, id, {
+    async run(id: string) {
+      const run = await router.createRunDelivery(connection.id, id, {
         conversationId: { feishu: LARK_CHAT, wechat: WECHAT_USER }[platform] as ConversationId,
-      }),
+      });
+      expect(run).not.toBeNull();
+      runs.push(run!);
+      return run!;
+    },
     texts: (): string[] =>
       fixture instanceof LarkApiFixture
         ? [...fixture.messages.values()].map((message) => JSON.parse(message.body.content).text)
@@ -101,10 +107,15 @@ async function deliveryStack(
     creates: () =>
       fixture.server.calls.filter((call) => call.method === "POST" && call.path === path),
     async [Symbol.asyncDispose]() {
-      await registry.stopAll();
-      await fixture.close();
-      test.close();
-      await directory[Symbol.asyncDispose]();
+      try {
+        for (const run of runs) await run.stop();
+        fixture.server.assertClean();
+      } finally {
+        await registry.stopAll();
+        await fixture.close();
+        test.close();
+        await directory[Symbol.asyncDispose]();
+      }
     },
   };
 }
@@ -124,45 +135,35 @@ describe.each([
       coalesceMs: 10_000,
     });
     await stack.configure({ mode, maxPartSize: 4, coalesceMs: 0, maxPendingAgeMs: 10_000 });
-    const run = (await stack.run(`mode-${mode}`))!;
-    try {
-      run.append("中文👋A");
-      if (mode !== "final") {
-        await rs.waitFor(() =>
-          expect(stack.texts()).toEqual(
-            platform === "feishu" && mode === "edit" ? ["中文👋", "A"] : ["中文👋"],
-          ),
-        );
-      }
-      const receipts = await run.finish("中文👋AB");
-      expect(stack.texts()).toEqual(["中文👋", "AB"]);
-      expect(receipts).toHaveLength(2);
-      expect(stack.creates()).toHaveLength(2);
-      const edits = stack.fixture.server.calls.filter((call) => call.method === "PUT");
-      expect(edits).toHaveLength(platform === "feishu" && mode === "edit" ? 1 : 0);
-      const rows = await stack.test.db.select().from(replyDeliveryParts);
-      expect(rows.map((row) => [row.sourceStart, row.sourceEnd, row.outcome])).toEqual([
-        [0, 4, "accepted"],
-        [4, 6, "accepted"],
-      ]);
-      stack.fixture.server.assertClean();
-    } finally {
-      await run.stop();
+    const run = await stack.run(`mode-${mode}`);
+    run.append("中文👋A");
+    if (mode !== "final") {
+      await rs.waitFor(() =>
+        expect(stack.texts()).toEqual(
+          platform === "feishu" && mode === "edit" ? ["中文👋", "A"] : ["中文👋"],
+        ),
+      );
     }
+    const receipts = await run.finish("中文👋AB");
+    expect(stack.texts()).toEqual(["中文👋", "AB"]);
+    expect(receipts).toHaveLength(2);
+    expect(stack.creates()).toHaveLength(2);
+    const edits = stack.fixture.server.calls.filter((call) => call.method === "PUT");
+    expect(edits).toHaveLength(platform === "feishu" && mode === "edit" ? 1 : 0);
+    const rows = await stack.test.db.select().from(replyDeliveryParts);
+    expect(rows.map((row) => [row.sourceStart, row.sourceEnd, row.outcome])).toEqual([
+      [0, 4, "accepted"],
+      [4, 6, "accepted"],
+    ]);
   });
 
   it("applies global configuration when the connection has no overrides", async () => {
     await using stack = await deliveryStack(platform, { mode: "final", maxPartSize: 4 });
-    const run = (await stack.run("global"))!;
-    try {
-      run.append("obsolete draft");
-      await run.finish("123456");
-      expect(stack.texts()).toEqual(["1234", "56"]);
-      expect(stack.creates()).toHaveLength(2);
-      stack.fixture.server.assertClean();
-    } finally {
-      await run.stop();
-    }
+    const run = await stack.run("global");
+    run.append("obsolete draft");
+    await run.finish("123456");
+    expect(stack.texts()).toEqual(["1234", "56"]);
+    expect(stack.creates()).toHaveLength(2);
   });
 
   it("coalesces block snapshots and paces physical creates", async () => {
@@ -172,22 +173,17 @@ describe.each([
       coalesceMs: 50,
       createSpacingMs: 25,
     });
-    const run = (await stack.run("paced"))!;
-    try {
-      const startedAt = Date.now();
-      run.complete("old", "final", "answer");
-      run.complete("abcdefghij", "final", "answer");
-      await rs.waitFor(() => expect(stack.texts()).toEqual(["abcd", "efgh", "ij"]));
-      await run.finish("abcdefghij");
-      const calls = stack.creates();
-      expect(calls).toHaveLength(3);
-      expect(calls[0].startedAt - startedAt).toBeGreaterThanOrEqual(45);
-      for (let index = 1; index < calls.length; index++) {
-        expect(calls[index].startedAt - calls[index - 1].completedAt!).toBeGreaterThanOrEqual(22);
-      }
-      stack.fixture.server.assertClean();
-    } finally {
-      await run.stop();
+    const run = await stack.run("paced");
+    const startedAt = Date.now();
+    run.complete("old", "final", "answer");
+    run.complete("abcdefghij", "final", "answer");
+    await rs.waitFor(() => expect(stack.texts()).toEqual(["abcd", "efgh", "ij"]));
+    await run.finish("abcdefghij");
+    const calls = stack.creates();
+    expect(calls).toHaveLength(3);
+    expect(calls[0].startedAt - startedAt).toBeGreaterThanOrEqual(45);
+    for (let index = 1; index < calls.length; index++) {
+      expect(calls[index].startedAt - calls[index - 1].completedAt!).toBeGreaterThanOrEqual(22);
     }
   });
 
@@ -197,16 +193,11 @@ describe.each([
       coalesceMs: 60_000,
       maxPendingAgeMs: 60_000,
     });
-    const run = (await stack.run("flush"))!;
-    try {
-      run.complete("ready", "final");
-      await run.finish("ready");
-      expect(stack.texts()).toEqual(["ready"]);
-      expect(stack.creates()).toHaveLength(1);
-      stack.fixture.server.assertClean();
-    } finally {
-      await run.stop();
-    }
+    const run = await stack.run("flush");
+    run.complete("ready", "final");
+    await run.finish("ready");
+    expect(stack.texts()).toEqual(["ready"]);
+    expect(stack.creates()).toHaveLength(1);
   });
 
   it("preserves Chinese, emoji and code across the configured transport boundary", async () => {
@@ -219,22 +210,17 @@ describe.each([
       boundary + "😀\n```ts\nconst 文 = '👋';\n```",
     ].entries()) {
       const previous = stack.texts().length;
-      const run = (await stack.run(`boundary-${index}`))!;
-      try {
-        const receipts = await run.finish(source);
-        const parts = stack.texts().slice(previous);
-        expect(parts).toHaveLength(index === 2 ? 2 : 1);
-        expect(receipts).toHaveLength(parts.length);
-        expect(parts.join("")).toBe(source);
-        for (const part of parts) {
-          expect(part.length).toBeLessThanOrEqual(limit);
-          expect(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/u.test(part)).toBe(false);
-        }
-      } finally {
-        await run.stop();
+      const run = await stack.run(`boundary-${index}`);
+      const receipts = await run.finish(source);
+      const parts = stack.texts().slice(previous);
+      expect(parts).toHaveLength(index === 2 ? 2 : 1);
+      expect(receipts).toHaveLength(parts.length);
+      expect(parts.join("")).toBe(source);
+      for (const part of parts) {
+        expect(part.length).toBeLessThanOrEqual(limit);
+        expect(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/u.test(part)).toBe(false);
       }
     }
-    stack.fixture.server.assertClean();
   });
 
   it("honors Retry-After and sends the latest pending snapshot once", async () => {
@@ -253,7 +239,7 @@ describe.each([
             : { ret: -1, errmsg: "limited" },
       },
     });
-    const run = (await stack.run("retry"))!;
+    const run = await stack.run("retry");
     try {
       run.complete("old", "final", "answer");
       await barrier.entered;
@@ -267,10 +253,8 @@ describe.each([
       const rows = await stack.test.db.select().from(replyDeliveryParts);
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({ outcome: "accepted", operation: "settle", sourceEnd: 6 });
-      stack.fixture.server.assertClean();
     } finally {
       barrier.release();
-      await run.stop();
     }
   });
 
@@ -281,7 +265,7 @@ describe.each([
     await using stack = await deliveryStack(platform, { mode: "blocks", maxPartSize: 4 });
     const barrier = requestBarrier();
     stack.fixture.server.once({ method: "POST", path: stack.path, before: barrier.wait });
-    const run = (await stack.run(`partial-${fault}`))!;
+    const run = await stack.run(`partial-${fault}`);
     try {
       const pending = run.finish("abcdefgh");
       const rejected = expect(pending).rejects.toMatchObject({
@@ -315,10 +299,8 @@ describe.each([
       ]);
       expect(rows[0].receipt).not.toBeNull();
       expect(rows[1].receipt).toBeNull();
-      stack.fixture.server.assertClean();
     } finally {
       barrier.release();
-      await run.stop();
     }
   });
 
@@ -336,7 +318,6 @@ describe.each([
       await expect(stack.run("invalid")).rejects.toThrow();
     }
     expect(stack.creates()).toHaveLength(0);
-    stack.fixture.server.assertClean();
   });
 });
 
@@ -347,77 +328,57 @@ it("falls back to final for WeChat edit mode and flushes without waiting for coa
     maxPartSize: 4,
     coalesceMs: 10_000,
   });
-  const run = (await stack.run("fallback"))!;
-  try {
-    run.append("old preview longer than a part");
-    await run.finish("answer");
-    expect(stack.texts()).toEqual(["answ", "er"]);
-    expect(stack.creates()).toHaveLength(2);
-    stack.fixture.server.assertClean();
-  } finally {
-    await run.stop();
-  }
+  const run = await stack.run("fallback");
+  run.append("old preview longer than a part");
+  await run.finish("answer");
+  expect(stack.texts()).toEqual(["answ", "er"]);
+  expect(stack.creates()).toHaveLength(2);
 });
 
 it("paces WeChat chunks at the production default interval without editing messages", async () => {
   const defaults = wechatDeliveryProfile("wechat-default-pacing");
   await using stack = await deliveryStack("wechat", { ...defaults, maxPartSize: 4 });
-  const run = (await stack.run("default-pacing"))!;
-  try {
-    await run.finish("abcdefghij");
-    expect(stack.texts()).toEqual(["abcd", "efgh", "ij"]);
-    const calls = stack.creates();
-    expect(calls).toHaveLength(3);
-    for (let index = 1; index < calls.length; index++) {
-      expect(calls[index].startedAt - calls[index - 1].completedAt!).toBeGreaterThanOrEqual(
-        Math.max(defaults.createSpacingMs, defaults.conversationSpacingMs) - 5,
-      );
-    }
-    expect(
-      stack.fixture.server.calls.filter((call) => ["PUT", "PATCH"].includes(call.method)),
-    ).toHaveLength(0);
-    stack.fixture.server.assertClean();
-  } finally {
-    await run.stop();
+  const run = await stack.run("default-pacing");
+  await run.finish("abcdefghij");
+  expect(stack.texts()).toEqual(["abcd", "efgh", "ij"]);
+  const calls = stack.creates();
+  expect(calls).toHaveLength(3);
+  for (let index = 1; index < calls.length; index++) {
+    expect(calls[index].startedAt - calls[index - 1].completedAt!).toBeGreaterThanOrEqual(
+      Math.max(defaults.createSpacingMs, defaults.conversationSpacingMs) - 5,
+    );
   }
+  expect(
+    stack.fixture.server.calls.filter((call) => ["PUT", "PATCH"].includes(call.method)),
+  ).toHaveLength(0);
 });
 
 it("edits every Feishu overflow part in place after a revised final snapshot", async () => {
   await using stack = await deliveryStack("feishu", { maxPartSize: 4 });
-  const run = (await stack.run("revised"))!;
-  try {
-    run.append("中文👋abcd尾巴");
-    await rs.waitFor(() => expect(stack.texts()).toEqual(["中文👋", "abcd", "尾巴"]));
-    const ids = [...stack.fixture.messages.keys()];
-    run.complete("汉字😀WXYZ结束", "final");
-    const receipts = await run.finish("汉字😀WXYZ结束");
-    expect(stack.texts()).toEqual(["汉字😀", "WXYZ", "结束"]);
-    expect([...stack.fixture.messages.keys()]).toEqual(ids);
-    expect(receipts.map((receipt) => receipt.messageId)).toEqual(ids);
-    expect(stack.creates()).toHaveLength(3);
-    expect(stack.fixture.server.calls.filter((call) => call.method === "PUT")).toHaveLength(3);
-    stack.fixture.server.assertClean();
-  } finally {
-    await run.stop();
-  }
+  const run = await stack.run("revised");
+  run.append("中文👋abcd尾巴");
+  await rs.waitFor(() => expect(stack.texts()).toEqual(["中文👋", "abcd", "尾巴"]));
+  const ids = [...stack.fixture.messages.keys()];
+  run.complete("汉字😀WXYZ结束", "final");
+  const receipts = await run.finish("汉字😀WXYZ结束");
+  expect(stack.texts()).toEqual(["汉字😀", "WXYZ", "结束"]);
+  expect([...stack.fixture.messages.keys()]).toEqual(ids);
+  expect(receipts.map((receipt) => receipt.messageId)).toEqual(ids);
+  expect(stack.creates()).toHaveLength(3);
+  expect(stack.fixture.server.calls.filter((call) => call.method === "PUT")).toHaveLength(3);
 });
 
 it("appends an explicit WeChat correction without rewriting or replaying the accepted prefix", async () => {
   await using stack = await deliveryStack("wechat", { maxPartSize: 4 });
-  const run = (await stack.run("correction"))!;
-  try {
-    run.append("old!tail");
-    await rs.waitFor(() => expect(stack.texts()).toEqual(["old!"]));
-    run.complete("NEW!tail", "final");
-    const receipts = await run.finish("NEW!tail");
-    expect(stack.texts()[0]).toBe("old!");
-    expect(stack.texts().slice(1).join("")).toBe("Correction:\nNEW!tail");
-    expect(receipts).toHaveLength(stack.texts().length);
-    expect(
-      stack.fixture.server.calls.filter((call) => ["PUT", "PATCH"].includes(call.method)),
-    ).toHaveLength(0);
-    stack.fixture.server.assertClean();
-  } finally {
-    await run.stop();
-  }
+  const run = await stack.run("correction");
+  run.append("old!tail");
+  await rs.waitFor(() => expect(stack.texts()).toEqual(["old!"]));
+  run.complete("NEW!tail", "final");
+  const receipts = await run.finish("NEW!tail");
+  expect(stack.texts()[0]).toBe("old!");
+  expect(stack.texts().slice(1).join("")).toBe("Correction:\nNEW!tail");
+  expect(receipts).toHaveLength(stack.texts().length);
+  expect(
+    stack.fixture.server.calls.filter((call) => ["PUT", "PATCH"].includes(call.method)),
+  ).toHaveLength(0);
 });

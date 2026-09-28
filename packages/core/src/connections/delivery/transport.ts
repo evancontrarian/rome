@@ -2,13 +2,7 @@ import type { ConversationId, MessageReceipt } from "@rome-os/app-runtime";
 import { MessageDeliveryError } from "@rome-os/app-runtime";
 import type { DeliveryProfile } from "./profile.js";
 
-export type DeliveryFailureKind =
-  | "rate-limit"
-  | "formatting"
-  | "unsupported"
-  | "authorization"
-  | "failed"
-  | "unknown";
+export type DeliveryFailureKind = MessageDeliveryError["kind"];
 
 export class DeliveryFailure extends MessageDeliveryError {}
 
