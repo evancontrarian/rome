@@ -66,14 +66,15 @@ describe("channelList", () => {
   let testDb: TestDb | undefined;
   afterEach(() => testDb?.close());
 
-  function setup(descriptors: ConnectionDescriptor[]) {
+  function setup(
+    descriptors: ConnectionDescriptor[],
+    admit = async (_id: string, _service: string, inbound: InboundMessage) =>
+      inbound.senderId === "guardian",
+  ) {
     testDb = createTestDb();
     const registry = new ConnectionRegistry({ ledger: new DrizzleGrantLedger(testDb.db) });
     for (const descriptor of descriptors) registry.register(descriptor);
-    const talkRouter = createTalkRouter(
-      registry,
-      async (_id, _service, inbound) => inbound.senderId === "guardian",
-    );
+    const talkRouter = createTalkRouter(registry, admit);
     // The Connection ids the channel ports hold a router subscription on.
     const subscribed: string[] = [];
     const router: typeof talkRouter = Object.assign(Object.create(talkRouter), {
@@ -250,6 +251,31 @@ describe("channelList", () => {
     // c-1's second event starts only once its first has settled, even though
     // that one failed.
     await rs.waitFor(() => expect(started).toEqual(["c1-first", "c2-first", "c1-second"]));
+  });
+
+  it("keeps a conversation's order when admission finishes out of order", async () => {
+    const service = talkService("telegram");
+    // Admission for the first message finishes after admission for the second,
+    // as two pooled database queries can.
+    const { registry, channels } = setup([service.descriptor], async (_id, _service, inbound) => {
+      if (inbound.messageId === "one") await new Promise((resolve) => setTimeout(resolve, 30));
+      return true;
+    });
+    const heard: string[] = [];
+    channels
+      .find((channel) => channel.name === "telegram")!
+      .inbound!.subscribe(async (event) => {
+        heard.push(event.message.messageId);
+      });
+
+    const connection = await registry.connect("telegram");
+    await registry.importCredential(connection.id, "bot", {
+      material: { token: "t" },
+      expiresAt: "never",
+    });
+    service.epochs[0]!.deliver?.(message({ messageId: "one" }));
+    service.epochs[0]!.deliver?.(message({ messageId: "two" }));
+    await rs.waitFor(() => expect(heard).toEqual(["one", "two"]));
   });
 
   it("drops events still queued for a handler once it unsubscribes", async () => {

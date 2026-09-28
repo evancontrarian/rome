@@ -54,14 +54,15 @@ export type InboundEvent = { kind: "message"; message: InboundMessage };
  *   that arrives with no subscriber, or while the channel is not receiving, is
  *   not delivered later; a subscriber catches up by reading `messages`.
  * - **R4 Fan-out, ordered per conversation.** Every subscriber hears every
- *   event. A subscriber hears one conversation's events one at a time, in the
- *   order admission passes them: its handler for an event starts after its
+ *   event. A subscriber hears one conversation's events one at a time, in
+ *   arrival order: its handler for an event starts after its
  *   handler for the previous event in that conversation settles. Different
  *   conversations and different subscribers never wait on each other, so one
  *   slow or failing handler holds up only its own conversation for its own
  *   subscriber. A handler that never settles stops that conversation for that
  *   subscriber for good, so a subscriber settles every event it takes. Events
- *   still queued when a subscription ends are dropped (R3).
+ *   still queued when a subscription ends are dropped (R3); a handler already
+ *   running keeps running.
  * - **R5 Durable subscription.** A subscription outlives a reconnect of
  *   whatever backs the channel.
  */

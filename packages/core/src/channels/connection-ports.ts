@@ -73,11 +73,13 @@ function connectionInbound(deps: ConnectionPortsDeps, service: string): Inbound 
   const attached = new Map<string, () => void>();
 
   // Each subscription hears one conversation's events one at a time, in the
-  // order they are dispatched here: an event waits for that subscription's
-  // previous event in the same conversation, and for nothing else (R4).
-  // Nothing upstream waits on delivery, so dispatch returns once every event
-  // is queued. An event still queued when its subscription ends is dropped
-  // (R3), so a replaced subscriber never answers after its successor starts.
+  // order they are dispatched here, which the router keeps as arrival order:
+  // an event waits for that subscription's previous event in the same
+  // conversation, and for nothing else (R4). Nothing upstream waits on
+  // delivery, so dispatch returns once every event is queued. An event still
+  // queued when its subscription ends is dropped (R3), so a replaced subscriber
+  // starts nothing new after it unsubscribes; a handler already running keeps
+  // running, and its subscriber owns stopping it.
   const dispatch = async (message: InboundMessage): Promise<void> => {
     if (!isAnswerable(message)) return;
     const event: InboundEvent = { kind: "message", message };

@@ -21,6 +21,9 @@ export class ConnectionTalkRouter implements TalkRouter {
 
   private readonly attached = new Map<ConnectionId, () => void>();
 
+  /** The last admission still running per connection and conversation. */
+  private readonly admissions = new Map<string, Promise<unknown>>();
+
   constructor(
     private readonly registry: ConnectionRegistry,
     private readonly admit?: (
@@ -96,13 +99,29 @@ export class ConnectionTalkRouter implements TalkRouter {
     const previous = this.attached.get(connection.id);
     previous?.();
     const detach = talk.subscribe(async (message) => {
-      if (this.admit && !(await this.admit(connection.id, connection.service, message, this)))
-        return;
+      if (this.admit && !(await this.admitInOrder(connection, message))) return;
       await Promise.all(
         [...(this.handlers.get(connection.id) ?? [])].map((handler) => handler(message)),
       );
     });
     this.attached.set(connection.id, detach);
+  }
+
+  /** Admission awaits the database, and pooled queries can finish in either
+   *  order. Each message's admission starts after the previous one in its
+   *  conversation settles, so handlers hear a conversation in arrival order. */
+  private admitInOrder(connection: Connection, message: InboundMessage): Promise<boolean> {
+    const admit = this.admit;
+    if (!admit) return Promise.resolve(true);
+    const key = `${connection.id}\0${message.conversationId}`;
+    const previous = this.admissions.get(key) ?? Promise.resolve();
+    const admitted = previous.then(() => admit(connection.id, connection.service, message, this));
+    const settled = admitted.catch(() => {});
+    this.admissions.set(key, settled);
+    void settled.then(() => {
+      if (this.admissions.get(key) === settled) this.admissions.delete(key);
+    });
+    return admitted;
   }
 
   private requireTalk(connectionId: string) {
