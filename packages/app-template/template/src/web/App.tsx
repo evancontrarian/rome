@@ -1,7 +1,7 @@
 import "./styles.css";
 import { useEffect, useState } from "react";
 import { fetchAppApi, type RomeAppBootstrap } from "@rome-os/app-web-sdk";
-import { CircleAlert, LayoutTemplate, RefreshCw } from "lucide-react";
+import { CircleAlert, LayoutTemplate, TriangleAlert } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@rome-os/ui/alert";
 import { Button } from "@rome-os/ui/button";
 import {
@@ -23,7 +23,6 @@ import {
   PageHeading,
   PageTitle,
   Section,
-  SectionActions,
   SectionDescription,
   SectionHeader,
   SectionHeading,
@@ -39,31 +38,46 @@ interface AppStatus {
   status: string;
 }
 
+// The UI stays current on its own: refetch on an interval and when the tab
+// becomes visible again. A failed update keeps the last good data on screen.
+const REFRESH_INTERVAL_MS = 30_000;
+
 export default function App({ bootstrap: _bootstrap }: { bootstrap: RomeAppBootstrap }) {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
   const [defaultView, setDefaultView] = useState("overview");
 
-  async function loadStatus(): Promise<void> {
-    setRefreshing(true);
-    setError(null);
-    try {
-      const response = await fetchAppApi("status");
-      if (!response.ok) {
-        throw new Error(`Status request failed (${response.status})`);
-      }
-      const data = (await response.json()) as AppStatus;
-      setStatus(data);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setRefreshing(false);
-    }
-  }
-
   useEffect(() => {
+    let cancelled = false;
+
+    async function loadStatus(): Promise<void> {
+      try {
+        const response = await fetchAppApi("status");
+        if (!response.ok) {
+          throw new Error(`Status request failed (${response.status})`);
+        }
+        const data = (await response.json()) as AppStatus;
+        if (cancelled) return;
+        setStatus(data);
+        setError(null);
+      } catch (err: unknown) {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    function refreshIfVisible(): void {
+      if (document.visibilityState === "visible") void loadStatus();
+    }
+
     void loadStatus();
+    const timer = window.setInterval(refreshIfVisible, REFRESH_INTERVAL_MS);
+    document.addEventListener("visibilitychange", refreshIfVisible);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshIfVisible);
+    };
   }, []);
 
   return (
@@ -126,15 +140,17 @@ export default function App({ bootstrap: _bootstrap }: { bootstrap: RomeAppBoots
                 Live read from <code>GET /api/apps/__APP_ID__/status</code>.
               </SectionDescription>
             </SectionHeading>
-            <SectionActions>
-              <Button onClick={() => void loadStatus()} disabled={refreshing}>
-                {refreshing ? <Spinner size="sm" label="Refreshing status" /> : <RefreshCw />}
-                {refreshing ? "Refreshing…" : "Refresh"}
-              </Button>
-            </SectionActions>
           </SectionHeader>
 
-          {error ? (
+          {error && status ? (
+            <Alert variant="warning">
+              <TriangleAlert />
+              <AlertTitle>Updates are failing</AlertTitle>
+              <AlertDescription>Showing the last loaded status. {error}</AlertDescription>
+            </Alert>
+          ) : null}
+
+          {error && !status ? (
             <Alert variant="destructive">
               <CircleAlert />
               <AlertTitle>Status unavailable</AlertTitle>
