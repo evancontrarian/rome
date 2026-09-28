@@ -89,6 +89,12 @@ describe("IM protocol fixtures with real SDKs", () => {
         });
         expect(fixture.messages.get(receipt.message_id)?.text).toBe("x".repeat(4096));
       }
+      for (const text of ["", "x".repeat(4097)]) {
+        await expect(bot.api.sendMessage("123", text)).rejects.toMatchObject({ error_code: 400 });
+      }
+      const rejected = fixture.server.calls.filter((call) => call.status === 400);
+      expect(rejected).toHaveLength(4);
+      expect(rejected.every((call) => !call.accepted)).toBe(true);
       expect(fixture.messages.size).toBe(1);
       await adapter.sendMessage("123", "123", {
         attachments: [{ type: "document", source: file }],

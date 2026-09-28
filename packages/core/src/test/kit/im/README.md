@@ -12,40 +12,6 @@ pnpm test:im
 
 The files use `.integration.test.ts`, so `pnpm test:integration` and its CI job include them. Fast unit tests remain in the unit suite.
 
-## Visual playground
-
-Run `pnpm dev:im` from the repository root and open the printed loopback URL.
-Pass a port with `pnpm --filter @rome/core dev:im 3211` when a fixed URL is useful.
-The server is a separate development process; production Rome does not load it.
-
-Choose Discord, Telegram, Feishu or WeChat, then **Apply & reset**. The shared
-configuration controls edit versus append playback, chunk size, update size and
-interval. Applying it closes the old SDK and fixture and clears the conversation.
-Each server process has one shared session, including across browser tabs.
-
-- **Inject incoming** delivers an event through the platform fixture and Rome
-  adapter. WeChat needs this first to establish its conversation context.
-- **Send** splits text into complete chunks. **Stream** edits each chunk in place
-  or appends complete chunks according to the selected behavior. **Edit** changes
-  a selected message. WeChat has no edit operation.
-- Fault controls reject, rate-limit or drop the response to the first outbound
-  request. SDK retry policies remain active; accepted messages can remain visible
-  even when the caller gets an error. Stop takes effect after the current request.
-- The conversation reads the fixture's message store. The request timeline shows
-  the latest 200 redacted calls; export includes this view and the configuration.
-  Reset after 1,000 calls. The session is held in memory.
-
-This is a text protocol debugger. Its playback loop is not Rome's production
-streaming scheduler, conversation router or receipt persistence. Chunk sizes
-measure UTF-16 units without splitting surrogate pairs; grapheme and Markdown
-boundaries are not modeled. Feishu and WeChat use a conservative 1,000-unit demo
-limit, not a claim about provider limits. Fault responses are synthetic scenarios.
-
-`playground-peer.ts` contains the platform SDK bindings. `playground.ts` owns the
-validated presets and shared playback loop. `playground.html` renders their shared
-state without platform-specific UI. To add a platform, add its fixture binding,
-preset and schema entry, and include it in `playground.integration.test.ts`.
-
 ## Supported contracts
 
 | Fixture | Real client | Modeled protocol |
