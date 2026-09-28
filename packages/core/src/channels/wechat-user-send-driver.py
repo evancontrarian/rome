@@ -23,6 +23,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import subprocess
 import time
 
@@ -152,9 +153,11 @@ class Desktop:
         return ids[0] if len(ids) == 1 else None
 
     def x_active(self):
-        out = self._run("xprop", "-root", "_NET_ACTIVE_WINDOW").stdout.split()
+        # With no active window (no EWMH manager, or one restarting) xprop prints
+        # "not found."; that is simply not active.
+        found = re.search(r"0x[0-9a-fA-F]+", self._run("xprop", "-root", "_NET_ACTIVE_WINDOW").stdout)
         win = self.window()
-        return bool(win and out) and int(out[-1], 16) == int(win, 16)
+        return bool(win and found) and int(found.group(0), 16) == int(win, 16)
 
     def activate(self):
         win = self.window()
@@ -218,15 +221,34 @@ class Driver:
         self.guard(name, focused)
         self.desk.key(name)
 
-    def rows(self):
+    def read_rows(self):
         """The search popup's rows as (index, node, name, states); WeChat's own
-        windows are frames, the popup is not. A vanished row reads empty: read again."""
+        windows are frames, the popup is not. Raises LookupError for a vanished row."""
+        lists = [n for top in self.app.children() if top.role != "frame"
+                 for n in find(top, lambda n, st: n.role == "list")]
+        return [(i, k, k.name, k.states()) for i, k in enumerate(lists[0].children())] if lists else []
+
+    def rows(self):
+        """The rows, or none when a row vanished mid-read: the caller reads again."""
         try:
-            lists = [n for top in self.app.children() if top.role != "frame"
-                     for n in find(top, lambda n, st: n.role == "list")]
-            return [(i, k, k.name, k.states()) for i, k in enumerate(lists[0].children())] if lists else []
+            return self.read_rows()
         except LookupError:
             return []
+
+    def popup_open(self):
+        """Whether results still show. A read that fails counts as open (fail closed)."""
+        try:
+            return bool(self.read_rows())
+        except LookupError:
+            return True
+
+    @staticmethod
+    def are_results(rows, name):
+        """The real results, not the recent-searches panel shown first, which can
+        list the target's own name from an earlier search: only the results carry
+        the web suggestion named after the query, right under "Internet search results"."""
+        return any(r[2] == NONLOCAL_HEADERS[0] and r[0] + 1 < len(rows) and rows[r[0] + 1][2] == name
+                   for r in rows)
 
     @staticmethod
     def local_hits(rows, name):
@@ -245,7 +267,8 @@ class Driver:
             self.clock.sleep(0.3)
             rows = self.rows()
             names = [r[2] for r in rows]
-            stable = stable + 1 if self.local_hits(rows, name) and names == seen else 0
+            ready = self.are_results(rows, name) and self.local_hits(rows, name)
+            stable = stable + 1 if ready and names == seen else 0
             seen = names
             if stable >= 2:
                 return rows
@@ -264,6 +287,8 @@ class Driver:
         self.key("Down", box)
         self.key("Up", box)
         rows = self.rows()
+        if not self.are_results(rows, name):  # the list changed under the keys
+            raise Failure("not-found", f"the search results for {name!r} changed before Return")
         if len(self.local_hits(rows, name)) > 1:  # a section that loaded during the keys
             raise Failure("ambiguous", f"more than one search result is named {name!r}")
         current = [r for r in rows if FOCUSED in r[3]]
@@ -293,7 +318,7 @@ class Driver:
         self.clock.sleep(0.8)
         # A chat result closes the list and keeps WeChat in front. Anything else, like a
         # web search window, fails here even when the target chat was already open.
-        if not self.active() or self.rows():
+        if not self.active() or self.popup_open():
             raise Failure("wrong-chat", "Return did not open a chat in WeChat's main window")
 
     def target_input(self, name):
@@ -359,7 +384,8 @@ class Driver:
             raise Failure("not-found", f"the store names {chat_id!r} {sorted(names)!r}, not {name!r}")
         before = {m["id"] for m in history if is_echo(m, body)}
         # Lines from the last minute, by id: the scan after Return uses the same bound,
-        # so a host clock ahead of WeChat's timestamps cannot hide a misdelivered copy.
+        # so a host clock up to 60 s ahead of WeChat's timestamps cannot hide a
+        # misdelivered copy. A larger skew can; NTP keeps both far inside it.
         since = int(self.clock.time()) - 60
         elsewhere_before = {m["id"] for m in self.store.recent(since, timeout=left(presend))}
         for attempt in range(3):  # a focus loss before typing starts over

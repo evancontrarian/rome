@@ -28,6 +28,12 @@ class FakeNode:
         self.shown, self.value, self.current = True, "", False
 
     def states(self):
+        c = self.client
+        if c.pending and self is c.list:  # one countdown per poll: a poll's walk reads this once
+            c.pending[0] -= 1
+            if c.pending[0] <= 0:
+                c.set_rows(c.pending[1])
+                c.pending = None
         st = {SHOWING} if self.shown else set()
         if self.editable:
             st.add(EDITABLE)
@@ -39,11 +45,6 @@ class FakeNode:
 
     def children(self):
         c = self.client
-        if c.pending and self is c.list:
-            c.pending[0] -= 1
-            if c.pending[0] <= 0:
-                c.set_rows(c.pending[1])
-                c.pending = None
         if self is c.list and c.vanish:
             c.vanish -= 1
             raise LookupError("a row went away")
@@ -369,6 +370,32 @@ class SendTests(unittest.TestCase):
         self.assertEqual((client.sent, client.search.value), ([], ""))
         self.assertNotIn("Return", desk.events)
 
+    def test_a_repeat_send_to_a_recently_searched_contact_waits_for_the_results(self):
+        client, desk, store, clock = rig()
+        client.recent, client.stale_polls = ["File Transfer"], 8  # listed by the earlier send's search
+        self.assertEqual(send(client, desk, store, clock), "filehelper:1")
+        self.assertEqual(client.sent, [("File Transfer", "rome test")])
+
+    def test_a_recent_panel_that_never_gives_way_is_not_acted_on(self):
+        client, desk, store, clock = rig()
+        client.recent, client.stale_polls = ["File Transfer"], 10**6
+        self.assertFails("not-found", False, lambda: send(client, desk, store, clock))
+        self.assertEqual((client.sent, client.search.value), ([], ""))
+        self.assertFalse({"Down", "Up", "Return"} & set(desk.events))
+
+    def test_a_lookup_error_after_return_is_not_read_as_a_closed_list(self):
+        client, desk, store, clock = rig()
+        key = client.key
+
+        def return_then_unreadable(name):
+            in_search = client.focus is client.search
+            key(name)
+            if name == "Return" and in_search:
+                client.popup.shown, client.vanish = True, 10**6  # still up, but unreadable
+        client.key = return_then_unreadable
+        self.assertFails("wrong-chat", False, lambda: send(client, desk, store, clock))
+        self.assertEqual(client.sent, [])
+
     def test_a_chat_history_hit_does_not_count_as_a_second_result(self):
         client, desk, store, clock = rig()
         client.results["File Transfer"] = ["File Transfer", "File Transfer\n3 related messages"]
@@ -620,6 +647,15 @@ class ReadinessTests(unittest.TestCase):
         helper = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(helper)
         self.assertEqual((d.MAX_TEXT, d.ENVELOPE_MARKERS), (helper.MAX_TEXT, helper.ENVELOPE_MARKERS))
+
+    def test_no_active_window_is_not_active(self):
+        desk = d.Desktop()
+        out = {"xprop": "_NET_ACTIVE_WINDOW:  not found.\n",
+               "xwininfo": '  0x1a "Weixin": ("wechat" "wechat")  1280x800+0+0\n'}
+        desk._run = lambda *a: subprocess.CompletedProcess(a, 0, out[a[0]], "")
+        self.assertFalse(desk.x_active())
+        out["xprop"] = "_NET_ACTIVE_WINDOW(WINDOW): window id # 0x1a\n"
+        self.assertTrue(desk.x_active())
 
     def test_the_main_window_is_found_by_either_title(self):
         tree = ('  0x1a "{}": ("wechat" "wechat")  1280x800+0+0\n'
