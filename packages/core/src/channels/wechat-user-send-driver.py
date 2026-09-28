@@ -260,19 +260,21 @@ class Driver:
         return [r for r in rows if r[2] == name and r[0] not in web]
 
     def settle(self, box, name):
-        """The rows once they hold a local one named after the query (not the web
-        suggestion, nor the recent searches shown first) and have stopped changing."""
-        seen, stable, deadline = None, 0, self.clock.time() + 6
+        """The real results (not the recent searches shown first) once they have
+        stopped changing: at once when they hold a local row named after the query,
+        else at the deadline, since local sections can load after the web one.
+        None when they never settled."""
+        seen, stable, steady, deadline = None, 0, None, self.clock.time() + 6
         while self.clock.time() < deadline and FOCUSED in box.states():
             self.clock.sleep(0.3)
             rows = self.rows()
             names = [r[2] for r in rows]
-            ready = self.are_results(rows, name) and self.local_hits(rows, name)
-            stable = stable + 1 if ready and names == seen else 0
+            stable = stable + 1 if self.are_results(rows, name) and names == seen else 0
             seen = names
-            if stable >= 2:
+            steady = rows if stable >= 2 else None
+            if steady and self.local_hits(rows, name):
                 return rows
-        return None
+        return steady
 
     def choose(self, box, name):
         """Leave current the one local result named `name`: index 1, under a first
@@ -281,20 +283,22 @@ class Driver:
         if rows is None:
             if FOCUSED not in box.states():
                 raise Failure("focus-lost", "the search lost focus before its results settled")
-            raise Failure("not-found", f"the search results for {name!r} never settled")
+            raise Failure("not-ready", f"the search results for {name!r} never settled")
+        if not self.local_hits(rows, name):  # settled, and truly absent
+            raise Failure("not-found", f"no search result is named {name!r}")
         if len(self.local_hits(rows, name)) > 1:
             raise Failure("ambiguous", f"more than one search result is named {name!r}")
         self.key("Down", box)
         self.key("Up", box)
         rows = self.rows()
         if not self.are_results(rows, name):  # the list changed under the keys
-            raise Failure("not-found", f"the search results for {name!r} changed before Return")
+            raise Failure("not-ready", f"the search results for {name!r} changed before Return")
         if len(self.local_hits(rows, name)) > 1:  # a section that loaded during the keys
             raise Failure("ambiguous", f"more than one search result is named {name!r}")
         current = [r for r in rows if FOCUSED in r[3]]
         header = rows[0][2] if rows else None
         if len(current) != 1 or current[0][0] != 1 or current[0][2] != name or header in NONLOCAL_HEADERS:
-            raise Failure("not-found", f"no local search result is named {name!r} (top: "
+            raise Failure("not-ready", f"the result named {name!r} is not the first local one (top: "
                           f"{current[0][2] if current else None!r} under {header!r})")
 
     def open_chat(self, name):
@@ -312,8 +316,9 @@ class Driver:
         try:
             self.choose(box, name)
             self.key("Return", box)
-        except Failure:
-            box.set_text("")
+        except Exception:  # noqa: BLE001 — any failure before Return leaves no query behind
+            with contextlib.suppress(Exception):
+                box.set_text("")
             raise
         self.clock.sleep(0.8)
         # A chat result closes the list and keeps WeChat in front. Anything else, like a
@@ -401,21 +406,29 @@ class Driver:
             return None
         self.press(name, body)
         deadline = self.clock.time() + ECHO_TIMEOUT_S
+        # A copy in another chat is only a misdelivery if the target's echo never comes:
+        # the same text sent there from the phone can land before our echo does.
+        elsewhere = None
         while True:
+            fresh, stray = [], []
             try:  # each read gets only what is left of the budget
                 fresh = [m for m in self.store.chat(chat_id, timeout=left(deadline))
                          if is_echo(m, body) and m["id"] not in before]
-                stray = [m for m in self.store.recent(since, timeout=left(deadline)) if is_echo(m, body)
-                         and m["conversationId"] != chat_id and m["id"] not in elsewhere_before]
+                # One Return makes one line: with an echo in the target, a copy elsewhere
+                # (the same text sent there from the phone) is not ours.
+                if not fresh:
+                    stray = [m for m in self.store.recent(since, timeout=left(deadline)) if is_echo(m, body)
+                             and m["conversationId"] != chat_id and m["id"] not in elsewhere_before]
             except Exception:  # noqa: BLE001 — a read that fails after Return is no echo yet
-                fresh, stray = [], []
-            if stray:
-                raise Failure("misdelivered", f"the text landed in {stray[0]['conversationId']}", True)
+                pass
             if fresh:
                 self.clear_leftover(name, body)
                 return fresh[-1]["id"]
+            elsewhere = elsewhere or (stray[0]["conversationId"] if stray else None)
             if self.clock.time() > deadline:
                 self.clear_leftover(name, body)
+                if elsewhere:
+                    raise Failure("misdelivered", f"the text landed in {elsewhere}, not the target", True)
                 raise Failure("no-echo", f"no copy in the store after {ECHO_TIMEOUT_S} s; check WeChat", True)
             self.clock.sleep(1.5)
 

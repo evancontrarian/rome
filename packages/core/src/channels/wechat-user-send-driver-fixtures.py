@@ -379,7 +379,7 @@ class SendTests(unittest.TestCase):
     def test_a_recent_panel_that_never_gives_way_is_not_acted_on(self):
         client, desk, store, clock = rig()
         client.recent, client.stale_polls = ["File Transfer"], 10**6
-        self.assertFails("not-found", False, lambda: send(client, desk, store, clock))
+        self.assertFails("not-ready", False, lambda: send(client, desk, store, clock))
         self.assertEqual((client.sent, client.search.value), ([], ""))
         self.assertFalse({"Down", "Up", "Return"} & set(desk.events))
 
@@ -395,6 +395,53 @@ class SendTests(unittest.TestCase):
         client.key = return_then_unreadable
         self.assertFails("wrong-chat", False, lambda: send(client, desk, store, clock))
         self.assertEqual(client.sent, [])
+
+    def test_results_without_a_web_section_never_settle_and_are_not_ready(self):
+        client, desk, store, clock = rig()
+        on_text = client.on_text
+
+        def offline(node):  # no web section: offline, or an interface whose header differs
+            on_text(node)
+            if client.pending:
+                client.pending[1] = [r for r in client.pending[1]
+                                     if r[1] != "web" and r[0] != "Internet search results"]
+        client.on_text = offline
+        self.assertFails("not-ready", False, lambda: send(client, desk, store, clock))
+        self.assertEqual((client.sent, client.search.value), ([], ""))
+        self.assertFalse({"Down", "Up", "Return"} & set(desk.events))
+
+    def test_any_error_while_choosing_leaves_no_query_behind(self):
+        client, desk, store, clock = rig()
+        states, reads = client.search.states, [0]
+
+        def unreadable_mid_search():
+            if client.search.value:
+                reads[0] += 1
+                if reads[0] > 3:
+                    raise LookupError("the search box went away")
+            return states()
+        client.search.states = unreadable_mid_search
+        self.assertFails("not-ready", False, lambda: send(client, desk, store, clock))
+        self.assertEqual((client.sent, client.search.value), ([], ""))
+
+    def test_the_same_text_sent_elsewhere_does_not_hide_the_echo(self):
+        client, desk, store, clock = rig()
+        key = client.key
+
+        def return_and_same_text_elsewhere(name):
+            key(name)
+            if name == "Return" and client.sent:  # "ok" sent to another chat from the phone
+                store.lines.append({"id": "wxid_other:1", "conversationId": "wxid_other",
+                                    "conversationName": "Li Wei", "isSelf": True, "type": "text",
+                                    "text": "rome test", "createTime": int(clock.now)})
+        client.key = return_and_same_text_elsewhere
+        answer = send(client, desk, store, clock)
+        self.assertEqual(answer, [m["id"] for m in store.lines if m["conversationId"] == "filehelper"][-1])
+
+    def test_a_copy_elsewhere_with_no_echo_is_a_misdelivery(self):
+        client, desk, store, clock = rig()
+        store.where = {"File Transfer": "wxid_other"}
+        self.assertFails("misdelivered", True, lambda: send(client, desk, store, clock))
 
     def test_a_chat_history_hit_does_not_count_as_a_second_result(self):
         client, desk, store, clock = rig()
