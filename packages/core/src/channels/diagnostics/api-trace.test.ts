@@ -184,6 +184,24 @@ describe("IM API diagnostics", () => {
     expect(events[0].exchangeId).toBe(events[1].exchangeId);
   });
 
+  it("stops traversing a branching SDK payload when the shared budget is exhausted", async () => {
+    const events: ImApiTraceEvent[] = [];
+    configureImApiTrace(["all"], (event) => events.push(event));
+    let reads = 0;
+    const body: Record<string, unknown> = {};
+    for (let i = 0; i < 200; i++)
+      Object.defineProperty(body, String(i), {
+        enumerable: true,
+        get: () => {
+          reads++;
+          return "x".repeat(2000);
+        },
+      });
+    await traceImApi("lark", "sdk", { body }, async () => "ok");
+    expect(reads).toBeLessThan(20);
+    expect(events[0].detail).toEqual({ omitted: "size limit" });
+  });
+
   it("preserves errors and delivery results when diagnostic sinks fail", async () => {
     configureImApiTrace(["all"], () => {
       throw new Error("sink failure");

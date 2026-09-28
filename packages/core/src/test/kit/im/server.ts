@@ -57,12 +57,23 @@ export function requestBarrier() {
 }
 
 function redact(value: unknown): unknown {
+  if (typeof value === "string" && /^\s*[\[{]/.test(value)) {
+    try {
+      return JSON.stringify(redact(JSON.parse(value)));
+    } catch {
+      return "[unparseable JSON]";
+    }
+  }
   if (Array.isArray(value)) return value.map(redact);
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(
     Object.entries(value).map(([key, item]) => [
       key,
-      /token|secret|authorization/i.test(key) ? "[redacted]" : redact(item),
+      /token|secret|authorization|cookie|password|credential|encrypt|aes[_-]?key|upload_param|api[_-]?key|ticket/i.test(
+        key,
+      )
+        ? "[redacted]"
+        : redact(item),
     ]),
   );
 }

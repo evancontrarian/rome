@@ -106,6 +106,7 @@ export class TelegramApiFixture {
       const text = String(body.text ?? "");
       if (!text.length || text.length > 4096)
         return {
+          status: 400,
           body: { ok: false, error_code: 400, description: "Bad Request: invalid text length" },
         };
       message.text = body.text;
@@ -117,9 +118,13 @@ export class TelegramApiFixture {
         operation,
       )
     ) {
-      if (String(body.text ?? "").length > 4096)
+      if (
+        String(body.text ?? "").length > 4096 ||
+        (operation === "sendMessage" && !String(body.text ?? "").length)
+      )
         return {
-          body: { ok: false, error_code: 400, description: "Bad Request: message is too long" },
+          status: 400,
+          body: { ok: false, error_code: 400, description: "Bad Request: invalid text length" },
         };
       const message = {
         message_id: this.nextId++,

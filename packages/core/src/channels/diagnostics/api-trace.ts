@@ -56,14 +56,22 @@ function safeUrl(value: string) {
   }
 }
 
-function sanitize(value: unknown, depth = 0): unknown {
+const sizeLimit = Symbol("trace size limit");
+
+function sanitize(value: unknown, depth = 0, budget = { remaining: LIMIT }): unknown {
+  budget.remaining -= 16;
+  if (budget.remaining < 0) throw sizeLimit;
   if (depth > 12) return "[depth limit]";
   if (typeof value === "string") {
+    if (value.length > budget.remaining) throw sizeLimit;
+    budget.remaining -= Buffer.byteLength(value);
+    if (budget.remaining < 0) throw sizeLimit;
     if (/^(https?|wss?):\/\//.test(value)) return safeUrl(value);
     if (/^\s*[\[{]/.test(value)) {
       try {
-        return JSON.stringify(sanitize(JSON.parse(value), depth + 1));
-      } catch {
+        return JSON.stringify(sanitize(JSON.parse(value), depth + 1, budget));
+      } catch (error) {
+        if (error === sizeLimit) throw error;
         return value.slice(0, LIMIT);
       }
     }
@@ -71,55 +79,67 @@ function sanitize(value: unknown, depth = 0): unknown {
   }
   if (value === null || typeof value === "number" || typeof value === "boolean") return value;
   if (value === undefined) return null;
-  if (value instanceof Headers) return sanitize(Object.fromEntries(value), depth + 1);
-  if (value instanceof URLSearchParams) return sanitize(Object.fromEntries(value), depth + 1);
-  if (value instanceof FormData)
-    return Array.from(value, ([name, item]) => ({
-      name,
-      value: secret.test(name) ? "[redacted]" : sanitize(item, depth + 1),
-    }));
   if (value instanceof Blob)
     return { omitted: "binary", bytes: value.size, contentType: value.type };
   if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer)
     return { omitted: "binary", bytes: value.byteLength };
-  if (Array.isArray(value)) return value.slice(0, 200).map((item) => sanitize(item, depth + 1));
+  if (Array.isArray(value)) {
+    const result: unknown[] = [];
+    for (const item of value.slice(0, 200)) result.push(sanitize(item, depth + 1, budget));
+    return result;
+  }
   if (typeof value === "object") {
-    if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
-      return { omitted: "non-JSON object" };
-    return Object.fromEntries(
-      Object.entries(value)
-        .slice(0, 200)
-        .map(([key, item]) => [
-          key,
-          secret.test(key) || (key === "code" && typeof item === "string")
-            ? "[redacted]"
-            : sanitize(item, depth + 1),
-        ]),
-    );
+    const entries = function* (): Generator<[string, unknown]> {
+      if (
+        value instanceof Headers ||
+        value instanceof URLSearchParams ||
+        value instanceof FormData
+      ) {
+        yield* value.entries();
+        return;
+      }
+      if (
+        Object.getPrototypeOf(value) !== Object.prototype &&
+        Object.getPrototypeOf(value) !== null
+      )
+        return;
+      for (const key in value) {
+        if (Object.hasOwn(value, key)) yield [key, (value as Record<string, unknown>)[key]];
+      }
+    };
+    const result: Record<string, unknown> = Object.create(null);
+    let count = 0;
+    for (const [key, item] of entries()) {
+      if (++count > 200) break;
+      budget.remaining -= key.length;
+      result[key] =
+        secret.test(key) || (key === "code" && typeof item === "string")
+          ? "[redacted]"
+          : sanitize(item, depth + 1, budget);
+    }
+    return result;
   }
   return "[omitted]";
 }
 
 function emit(event: Omit<ImApiTraceEvent, "schemaVersion" | "timestamp">) {
   try {
-    const safe = sanitize(event.detail);
-    const encoded = JSON.stringify(safe);
-    const detail =
-      Buffer.byteLength(encoded) > LIMIT
-        ? {
-            ...Object.fromEntries(
-              Object.entries(safe && typeof safe === "object" ? safe : {}).flatMap(
-                ([key, value]) =>
-                  ["method", "url", "status", "code", "name"].includes(key) &&
-                  (typeof value === "string" || typeof value === "number")
-                    ? [[key, typeof value === "string" ? value.slice(0, 1024) : value]]
-                    : [],
-              ),
-            ),
-            omitted: "size limit",
-            bytes: Buffer.byteLength(encoded),
-          }
-        : safe;
+    let detail: unknown;
+    try {
+      detail = sanitize(event.detail);
+      if (Buffer.byteLength(JSON.stringify(detail)) > LIMIT) throw sizeLimit;
+    } catch (error) {
+      if (error !== sizeLimit) throw error;
+      const metadata: Record<string, unknown> = { omitted: "size limit" };
+      if (event.detail && typeof event.detail === "object") {
+        for (const key of ["method", "url", "status", "code", "name"]) {
+          const value = (event.detail as Record<string, unknown>)[key];
+          if (typeof value === "number") metadata[key] = value;
+          if (typeof value === "string" && value.length <= 1024) metadata[key] = sanitize(value);
+        }
+      }
+      detail = metadata;
+    }
     sink({
       ...event,
       schemaVersion: 1,
