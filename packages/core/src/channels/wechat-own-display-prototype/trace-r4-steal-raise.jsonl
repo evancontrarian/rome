@@ -1,0 +1,61 @@
+{"t": 6.926, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 8.842, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 10.421, "event": "reliability.result", "run": 1, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 4.9, "steal_after_s": 3.16, "fired_at": 3.17}
+{"t": 13.878, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 16.437, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 18.11, "event": "reliability.result", "run": 2, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 4.6, "steal_after_s": 0.63, "fired_at": 0.64}
+{"t": 22.382, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 25.216, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 26.837, "event": "reliability.result", "run": 3, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 4.8, "steal_after_s": 2.26, "fired_at": 2.27}
+{"t": 31.61, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 34.854, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 36.672, "event": "reliability.result", "run": 4, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 5.4, "steal_after_s": 0.56, "fired_at": 0.57}
+{"t": 42.477, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 44.512, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 46.285, "event": "reliability.result", "run": 5, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 5.2, "steal_after_s": 4.09, "fired_at": 4.12}
+{"t": 51.429, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 53.518, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 55.239, "event": "reliability.result", "run": 6, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 5.0, "steal_after_s": 3.36, "fired_at": 3.37}
+{"t": 60.662, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 62.698, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 64.439, "event": "reliability.result", "run": 7, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 5.1, "steal_after_s": 3.53, "fired_at": 3.56}
+{"t": 68.735, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 71.859, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 73.552, "event": "reliability.result", "run": 8, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 5.2, "steal_after_s": 0.33, "fired_at": 0.36}
+{"t": 78.06, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 80.916, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 82.549, "event": "reliability.result", "run": 9, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 4.9, "steal_after_s": 1.95, "fired_at": 1.99}
+{"t": 88.789, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 90.81, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 92.591, "event": "reliability.result", "run": 10, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 5.6, "steal_after_s": 4.87, "fired_at": 4.88}
+{"t": 98.906, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 100.927, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 102.604, "event": "reliability.result", "run": 11, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 6.1, "steal_after_s": 4.96, "fired_at": 4.98}
+{"t": 107.843, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 109.852, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 111.563, "event": "reliability.result", "run": 12, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 5.1, "steal_after_s": 3.11, "fired_at": 3.13}
+{"t": 115.508, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 118.486, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 120.166, "event": "reliability.result", "run": 13, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 5.0, "steal_after_s": 2.61, "fired_at": 2.64}
+{"t": 125.888, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 127.898, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 129.556, "event": "reliability.result", "run": 14, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 5.5, "steal_after_s": 4.3, "fired_at": 4.31}
+{"t": 134.852, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 136.884, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 138.439, "event": "reliability.result", "run": 15, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 5.0, "steal_after_s": 4.1, "fired_at": 4.11}
+{"t": 142.309, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 144.224, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 145.79, "event": "reliability.result", "run": 16, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 4.6, "steal_after_s": 2.51, "fired_at": 2.52}
+{"t": 149.197, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 151.79, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 153.339, "event": "reliability.result", "run": 17, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 4.5, "steal_after_s": 0.88, "fired_at": 0.89}
+{"t": 156.609, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 159.394, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 160.995, "event": "reliability.result", "run": 18, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 4.7, "steal_after_s": 2.11, "fired_at": 2.12}
+{"t": 165.75, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 167.66, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 169.226, "event": "reliability.result", "run": 19, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 5.2, "steal_after_s": 3.6, "fired_at": 3.61}
+{"t": 172.784, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 175.291, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 176.885, "event": "reliability.result", "run": 20, "condition": "focus-steal", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 4.4, "steal_after_s": 2.02, "fired_at": 2.03}
+{"t": 177.543, "event": "reliability.summary", "total": 20, "ok": 20, "leaks": 0, "back_used": 0, "by_condition": {"focus-steal": {"runs": 20, "ok": 20, "stops": [], "leaks": 0}}}

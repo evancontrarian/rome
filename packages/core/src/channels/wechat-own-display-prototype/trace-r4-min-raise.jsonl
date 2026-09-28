@@ -1,0 +1,7 @@
+{"t": 7.428, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 9.88, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 11.41, "event": "reliability.result", "run": 1, "condition": "minimized", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 4.3}
+{"t": 15.492, "event": "raise", "via": "EWMH _NET_ACTIVE_WINDOW (X11)"}
+{"t": 17.993, "event": "choose", "current": [[1, "File Transfer"]], "first_header": "Features", "exact_rows": [1]}
+{"t": 19.611, "event": "reliability.result", "run": 2, "condition": "minimized", "outcome": "reached-and-cleared", "code": null, "reason": null, "keys": ["Down", "Up", "Return"], "leaked_bytes": 0, "back_used": 0, "window_after": {"geom": "1280x800", "maximized": true, "hidden": false}, "secs": 4.5}
+{"t": 20.339, "event": "reliability.summary", "total": 2, "ok": 2, "leaks": 0, "back_used": 0, "by_condition": {"minimized": {"runs": 2, "ok": 2, "stops": [], "leaks": 0}}}
