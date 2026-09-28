@@ -492,7 +492,20 @@ export function useAppLifecycle(
         emails,
       },
       {
-        onSuccess: () => setAccessTarget(null),
+        // A shared mode keeps the dialog open so its link can be copied right
+        // away; the target takes the saved mode, which enables copy.
+        onSuccess: (_result, { mode }) => {
+          if (mode === "private" || !app.fullHref || !shareableOrigin()) {
+            setAccessTarget(null);
+            return;
+          }
+          setAccessTarget({
+            ...app,
+            accessMode: mode,
+            isPublic: mode === "public",
+            cloudAllowedEmails: emails,
+          });
+        },
         onError: (err) =>
           setAccessDialogError(
             err instanceof Error ? err.message : t("installed.errors.publicAccessFailed"),
@@ -530,14 +543,22 @@ export function useAppLifecycle(
   const shareOrigin = shareableOrigin();
   const accessShareUrl =
     accessTarget?.fullHref && shareOrigin ? `${shareOrigin}${accessTarget.fullHref}` : null;
-  // The link only opens once the picked mode is saved, and saving closes the
-  // dialog, so copy waits for a saved shared mode. The Clipboard API exists in
+  // The link only opens once the picked mode is saved, so copy waits for a
+  // saved shared mode. The Clipboard API exists in
   // secure contexts only; elsewhere the field, which selects on focus, is the
   // way to copy.
   const accessSavedMode: AppAccessMode | null = accessTarget
     ? (accessTarget.accessMode ?? (accessTarget.isPublic ? "public" : "private"))
     : null;
   const accessLinkUnsaved = accessModeDraft !== accessSavedMode;
+  // Nothing left to save: the dismiss button reads "Done" rather than "Cancel".
+  const accessSavedEmails = accessTarget?.cloudAllowedEmails ?? [];
+  const accessDraftUnsaved =
+    accessLinkUnsaved ||
+    (accessModeDraft === "cloud-email" &&
+      (accessEmailInput.trim() !== "" ||
+        accessEmailsDraft.length !== accessSavedEmails.length ||
+        accessEmailsDraft.some((email, i) => email !== accessSavedEmails[i])));
   const canCopyAccessLink = typeof navigator !== "undefined" && Boolean(navigator.clipboard);
   const copyAccessShareUrl = () => {
     if (!accessShareUrl) return;
@@ -779,7 +800,9 @@ export function useAppLifecycle(
             onClick={cancelAccessDialog}
             disabled={accessSaving}
           >
-            {t("installed.accessDialog.cancel")}
+            {accessDraftUnsaved
+              ? t("installed.accessDialog.cancel")
+              : t("installed.accessDialog.done")}
           </Button>
           <Button
             type="button"

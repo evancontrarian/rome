@@ -11,6 +11,9 @@ import { useAppLifecycle } from "./use-app-lifecycle";
 // jsdom serves the page on localhost, which the dialog treats as unshareable.
 const origin = rs.hoisted(() => ({ value: "https://jessie.romeos.cc" as string | null }));
 rs.mock("@/lib/shareable-origin", () => ({ shareableOrigin: () => origin.value }));
+// Saving reads then writes /api/public-access; both succeed with an empty config.
+const fetchJson = rs.hoisted(() => rs.fn(async (_url: string, _init?: unknown) => ({})));
+rs.mock("@/lib/fetch-json", () => ({ fetchJson }));
 
 beforeAll(async () => {
   await i18n.changeLanguage("en");
@@ -183,6 +186,34 @@ describe("the app access dialog", () => {
       expect(writeText).toHaveBeenCalledWith(SHARE_URL);
       expect(await screen.findByRole("button", { name: "Copied" })).toBeTruthy();
       expect(screen.queryByText("Save access before sharing this link.")).toBeNull();
+    });
+
+    it("stays open after saving a shared mode, with copy ready", async () => {
+      await openDialog();
+      await userEvent.click(screen.getByRole("radio", { name: /Public/ }));
+      await userEvent.click(screen.getByRole("button", { name: "Save access" }));
+
+      const copy = await screen.findByRole("button", { name: "Copy link" });
+      await waitFor(() => expect(copy.hasAttribute("disabled")).toBe(false));
+      expect(fetchJson).toHaveBeenCalledWith(
+        "/api/public-access",
+        expect.objectContaining({
+          method: "PUT",
+          json: expect.objectContaining({ allowedApps: ["@ray/demo"] }),
+        }),
+      );
+      expect(screen.getByRole("radiogroup")).toBeTruthy();
+      expect(screen.queryByText("Save access before sharing this link.")).toBeNull();
+      expect(screen.getByRole("button", { name: "Done" })).toBeTruthy();
+    });
+
+    it("closes after saving private, which has no link to copy", async () => {
+      await openDialog({ ...APP, accessMode: "public", isPublic: true } as InstalledAppCard);
+      await userEvent.click(screen.getByRole("radio", { name: /Private/ }));
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+      await userEvent.click(screen.getByRole("button", { name: "Save access" }));
+
+      await waitFor(() => expect(screen.queryByRole("radiogroup")).toBeNull());
     });
 
     it("offers no copy button where the browser has no clipboard", async () => {
