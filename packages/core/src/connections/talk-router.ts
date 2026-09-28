@@ -109,7 +109,10 @@ export class ConnectionTalkRouter implements TalkRouter {
 
   /** Admission awaits the database, and pooled queries can finish in either
    *  order. Each message's admission starts after the previous one in its
-   *  conversation settles, so handlers hear a conversation in arrival order. */
+   *  conversation settles, so handlers hear a conversation in arrival order.
+   *  An admission therefore holds up its conversation's next message for as
+   *  long as it runs; pairing admission waits only on its reads and sends its
+   *  replies in the background. */
   private admitInOrder(connection: Connection, message: InboundMessage): Promise<boolean> {
     const admit = this.admit;
     if (!admit) return Promise.resolve(true);
