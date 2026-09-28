@@ -144,6 +144,45 @@ function isResultSuccess(result: SDKResultMessage): result is SDKResultSuccess {
   return result.subtype === "success";
 }
 
+/** The uuids of the sends a frame or result answers (the SDK's echo). */
+function echoedSendIds(message: {
+  user_message_uuid?: string;
+  user_message_uuids?: string[];
+}): string[] {
+  return (
+    message.user_message_uuids ?? (message.user_message_uuid ? [message.user_message_uuid] : [])
+  );
+}
+
+/** A frame of a turn's output, as opposed to session-level system messages. */
+function isTurnFrame(message: SDKMessage): boolean {
+  return (
+    isPartialAssistantMessage(message) || isAssistantMessage(message) || isUserMessage(message)
+  );
+}
+
+// Which side owns the SDK turn after `message`. A replay of one of Rome's
+// sends, or a frame echoing one, gives the turn to Rome. That is also how a
+// send the SDK folds into its own turn takes that turn over. A turn whose first
+// frame echoes none of Rome's sends is one the SDK started by itself. Later
+// frames of a turn carry no echo, so they keep the owner.
+function sdkTurnOwnerAfter(
+  message: SDKMessage,
+  current: "rome" | "sdk" | undefined,
+  romeSendIds: ReadonlySet<string>,
+): "rome" | "sdk" | undefined {
+  if (isUserMessage(message)) {
+    const replay = "isReplay" in message && message.isReplay ? message.uuid : undefined;
+    return replay && romeSendIds.has(replay) ? "rome" : current;
+  }
+  const isModelFrame =
+    (isAssistantMessage(message) || isPartialAssistantMessage(message)) &&
+    message.parent_tool_use_id === null;
+  if (!isModelFrame) return current;
+  if (echoedSendIds(message).some((id) => romeSendIds.has(id))) return "rome";
+  return current ?? "sdk";
+}
+
 function isTextBlock(block: AssistantContentBlock): block is BetaTextBlock {
   return block.type === "text";
 }
@@ -486,13 +525,24 @@ export class AnthropicProvider implements ModelProvider {
     const { sessionId } = params;
     const pendingSteers = new Set<string>();
     const deferredInputs = new Set<string>();
-    let promptPermits = 0;
-    let releasePrompt: (() => void) | undefined;
-    let gateClosed = false;
-    const permitPrompt = () => {
-      promptPermits++;
-      releasePrompt?.();
-      releasePrompt = undefined;
+    // Every send carries a uuid and origin {kind:"human"}. The SDK echoes a
+    // send's uuid on the frames and result of the turn that answers it, and a
+    // turn it starts by itself (a finished background task) echoes none. That
+    // echo, not the prompt text, decides which Rome turn owns the SDK's output.
+    const romeSendIds = new Set<string>();
+    // Uuids minted for sends without an inputId. Rome issued no id for them,
+    // so their replay reports no input status.
+    const mintedSendIds = new Set<string>();
+    // Owner of the SDK turn now streaming; undefined between a result and the
+    // next turn's first frame.
+    let sdkTurnOwner: "rome" | "sdk" | undefined;
+    // A turn for one of Rome's sends can start with no Rome turn open, e.g. a
+    // steer the SDK carried past the previous turn's result. Reading pauses
+    // until Rome opens the next turn, so its output has an owner.
+    let resumeReading: (() => void) | undefined;
+    const openRomeTurn = () => {
+      resumeReading?.();
+      resumeReading = undefined;
     };
     // A cancelled first turn can leave a user-only transcript that is not
     // resumable. Its id is still reserved by the CLI, so don't reuse it.
@@ -519,32 +569,6 @@ export class AnthropicProvider implements ModelProvider {
         // `text_delta` previews while a text block is still being generated.
         includePartialMessages: true,
         extraArgs: { "replay-user-messages": null },
-        hooks: {
-          UserPromptSubmit: [
-            {
-              timeout: 600,
-              hooks: [
-                async (_input, _toolUseId, { signal }) => {
-                  // Same-loop steering skips this hook. A late SDK-queued input
-                  // starts a new loop, which must wait for Rome's next turn owner.
-                  while (!promptPermits && !gateClosed && !signal.aborted) {
-                    await new Promise<void>((resolve) => {
-                      const wake = () => {
-                        signal.removeEventListener("abort", wake);
-                        resolve();
-                      };
-                      releasePrompt = wake;
-                      signal.addEventListener("abort", wake, { once: true });
-                    });
-                  }
-                  if (gateClosed || signal.aborted) return { continue: false };
-                  promptPermits--;
-                  return {};
-                },
-              ],
-            },
-          ],
-        },
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         settingSources: ["project"],
@@ -609,6 +633,25 @@ export class AnthropicProvider implements ModelProvider {
       let partialText = "";
       try {
         for await (const message of q) {
+          const owner = sdkTurnOwnerAfter(message, sdkTurnOwner, romeSendIds);
+          if (owner !== sdkTurnOwner) {
+            sdkTurnOwner = owner;
+            if (owner === "rome" && !running && !closed) {
+              await new Promise<void>((resolve) => {
+                resumeReading = resolve;
+              });
+            }
+          }
+          // First assistant message means the SDK has written user+assistant
+          // turns to the transcript: record the SDK's own session id so the
+          // host can persist it and safely `{ resume }` next time. Capturing
+          // here (not at the `system`/init event) is deliberate — an init-only
+          // transcript with zero messages also fails to resume. A turn the SDK
+          // started by itself writes the transcript too.
+          if (establishedThreadId === undefined && isAssistantMessage(message)) {
+            establishedThreadId = message.session_id;
+          }
+          if (sdkTurnOwner === "sdk" && isTurnFrame(message)) continue;
           if (isPartialAssistantMessage(message)) {
             // Incremental preview of an in-flight text block. The complete
             // `text` block still arrives on the assistant message, so this is
@@ -628,14 +671,6 @@ export class AnthropicProvider implements ModelProvider {
               }
             }
           } else if (isAssistantMessage(message)) {
-            // First assistant message means the SDK has written user+assistant
-            // turns to the transcript: record the SDK's own session id so the
-            // host can persist it and safely `{ resume }` next time. Capturing
-            // here (not at the `system`/init event) is deliberate — an init-only
-            // transcript with zero messages also fails to resume.
-            if (establishedThreadId === undefined) {
-              establishedThreadId = message.session_id;
-            }
             if (message.parent_tool_use_id === null) {
               activeTurnLastAssistantMessageId = message.uuid;
             }
@@ -685,7 +720,13 @@ export class AnthropicProvider implements ModelProvider {
               }
             }
           } else if (isUserMessage(message)) {
-            if ("isReplay" in message && message.isReplay && message.uuid) {
+            if (
+              "isReplay" in message &&
+              message.isReplay &&
+              message.uuid &&
+              romeSendIds.has(message.uuid) &&
+              !mintedSendIds.has(message.uuid)
+            ) {
               pendingSteers.delete(message.uuid);
               yield { type: "input_status", inputId: message.uuid, state: "consumed" };
             }
@@ -693,9 +734,25 @@ export class AnthropicProvider implements ModelProvider {
               yield toolResult;
             }
           } else if (isResultMessage(message)) {
+            const echoed = echoedSendIds(message).filter((id) => romeSendIds.has(id));
+            sdkTurnOwner = undefined;
+            // Results of turns the SDK started for a finished background task
+            // answer none of Rome's sends. They end no Rome turn.
+            if (echoed.length === 0 && message.origin?.kind === "task-notification") {
+              log.info("SDK-initiated turn ended outside any Rome turn", {
+                subtype: message.subtype,
+                numTurns: message.num_turns,
+                result: isResultSuccess(message) ? message.result.slice(0, 200) : undefined,
+              });
+              continue;
+            }
+            for (const id of echoed) {
+              romeSendIds.delete(id);
+              mintedSendIds.delete(id);
+            }
             running = false;
             // The SDK owns these queued messages already. Rebind them to a
-            // new Rome turn before allowing its next UserPromptSubmit hook.
+            // new Rome turn before reading on into the turn that answers them.
             for (const inputId of pendingSteers) {
               deferredInputs.add(inputId);
               yield { type: "input_status", inputId, state: "queued" };
@@ -893,7 +950,7 @@ export class AnthropicProvider implements ModelProvider {
         // current turn.
         lastCompletedTurnCheckpoint = undefined;
         running = true;
-        permitPrompt();
+        openRomeTurn();
         if (input.inputId && deferredInputs.delete(input.inputId)) return;
         const content: NonNullable<SDKUserMessage["message"]["content"]> = [];
         if (input.injectedToolResult) {
@@ -910,9 +967,13 @@ export class AnthropicProvider implements ModelProvider {
           activeTurnLastAssistantMessageId = undefined;
           running = true;
         }
+        const uuid = input.inputId ?? randomUUID();
+        romeSendIds.add(uuid);
+        if (!input.inputId) mintedSendIds.add(uuid);
         const sdkMsg: SDKUserMessage = {
           type: "user",
-          ...(input.inputId ? { uuid: input.inputId as SDKUserMessage["uuid"] } : {}),
+          uuid: uuid as SDKUserMessage["uuid"],
+          origin: { kind: "human" },
           priority: "next",
           parent_tool_use_id: null,
           session_id: sdkSessionId,
@@ -931,9 +992,11 @@ export class AnthropicProvider implements ModelProvider {
         if (input.reasoningEffort && toAnthropicEffort(input.reasoningEffort) !== effort)
           return "deferred";
         pendingSteers.add(input.inputId);
+        romeSendIds.add(input.inputId);
         inputQueue.push({
           type: "user",
           uuid: input.inputId as SDKUserMessage["uuid"],
+          origin: { kind: "human" },
           priority: "next",
           parent_tool_use_id: null,
           session_id: sdkSessionId,
@@ -981,14 +1044,14 @@ export class AnthropicProvider implements ModelProvider {
       },
       async interrupt(reason?: string): Promise<void> {
         log.info("ModelSession interrupt requested", { reason });
+        openRomeTurn();
         await queryProcess.abort();
         inputQueue.end();
       },
       async close(): Promise<void> {
         if (queryDisposed) return;
         queryDisposed = true;
-        gateClosed = true;
-        releasePrompt?.();
+        openRomeTurn();
         try {
           inputQueue.end();
         } catch {
