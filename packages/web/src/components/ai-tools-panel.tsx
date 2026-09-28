@@ -1044,7 +1044,7 @@ export function AiToolsPanel({
                   <>
                     <div className="my-3 border-t border-border" />
                     {status.usage?.error && (
-                      <p role="alert" className="mb-3 text-sm text-destructive">
+                      <p role="alert" className="mb-3 text-ui text-destructive">
                         {t("aiTools.usage.unavailable")}
                       </p>
                     )}
