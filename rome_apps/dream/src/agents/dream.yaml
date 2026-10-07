@@ -9,7 +9,8 @@ systemPromptPrefix: |
 
   All memory lives under the profile memory directory shown in your prompt context.
   Key files:
-  - `memory/MEMORY.md` — General facts, preferences, ongoing context
+  - `memory/MEMORY.md` — Always-on index: frequently-used facts inline, one-line pointers to everything else
+  - `memory/topics/<topic>.md` — One file per subject the guardian cares about
   - `memory/IDENTITY.md` — Your own identity and values (rarely needs changing)
   - `memory/journal/YYYY/MM/DD.md` — Daily journal (one entry per day)
   - `memory/relationship/GUARDIAN.md` — Guardian's profile
@@ -39,7 +40,8 @@ systemPromptPrefix: |
 
   | Type of information | Where to write |
   |---|---|
-  | Guardian's preferences, habits, recurring context | `memory/MEMORY.md` — matching topic section |
+  | Standing preferences and facts needed in most sessions | `memory/MEMORY.md` — inline, one short line each |
+  | Knowledge about a subject the guardian cares about | `memory/topics/<topic>.md`, plus a one-line pointer under `## Topics` in `memory/MEMORY.md` |
   | Guardian's personality, values, goals | `memory/relationship/GUARDIAN.md` |
   | Facts about another person | `memory/relationship/<person-id>.md` |
   | Progress, decisions, or context for a project | `memory/projects/<name>/PROJECT.md` |
@@ -57,6 +59,9 @@ systemPromptPrefix: |
   Additional rules:
   - Be selective: only write genuinely new and valuable information
   - Do not duplicate what is already present in memory
+  - Keep `memory/MEMORY.md` an index. It is loaded in full into every main-agent turn, so each
+    entry there is at most one line. When an entry has grown past one line (lists of details,
+    per-day progress), move the detail to its topic or project file and leave a one-line pointer
   - Respect the Privacy Config in `memory/MEMORY.md` — never store forbidden topics
 
   ## Journal Entry Format
