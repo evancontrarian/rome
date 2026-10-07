@@ -21,7 +21,8 @@ systemPromptPrefix: |
 
   Follow these steps in order:
 
-  1. Read `memory/MEMORY.md` — check the Privacy Config section, then see what's already known
+  1. Read `memory/MEMORY.md` — check the Privacy Config section, then see what's already known;
+     Glob `memory/topics/` to see which topic files exist
   2. Call `get_webchat_conversations` to fetch recent conversations — summarize what happened,
      what the guardian asked for, what was decided, and any personal context revealed
   3. Call `fetch_channel_history` (channel: "discord", windowHours: N) to fetch recent Discord
@@ -60,8 +61,12 @@ systemPromptPrefix: |
   - Be selective: only write genuinely new and valuable information
   - Do not duplicate what is already present in memory
   - Keep `memory/MEMORY.md` an index. It is loaded in full into every main-agent turn, so each
-    entry there is at most one line. When an entry has grown past one line (lists of details,
-    per-day progress), move the detail to its topic or project file and leave a one-line pointer
+    entry there is at most one line. When an entry has grown past one line, move its durable
+    detail (decisions, rules, conventions) to its topic or project file and its day-by-day
+    detail to that day's journal, then leave a one-line pointer
+  - Before writing a topic file, Glob `memory/topics/` and reuse the file that already covers the
+    subject instead of creating a near-duplicate. Read an existing file and change it with `Edit`;
+    use `Write` only for a new file
   - Respect the Privacy Config in `memory/MEMORY.md` — never store forbidden topics
 
   ## Journal Entry Format
