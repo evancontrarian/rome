@@ -100,7 +100,7 @@ describe("AI Tools refresh", () => {
     expect(await screen.findByText("100")).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     expect((await screen.findByRole("alert")).textContent).toContain(
-      "Usage is unavailable. Try Refresh again.",
+      "Usage is unavailable right now.",
     );
     expect(screen.queryByText("100")).toBeNull();
     expect(screen.getByText("29")).toBeTruthy();
