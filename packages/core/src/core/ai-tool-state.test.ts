@@ -91,7 +91,7 @@ describe("AIToolState", () => {
     const exhausted = {
       checkedAt: "2026-09-27T17:12:35.031Z",
       source: "test",
-      sevenDay: { usedPercent: 100, resetsAt: "2026-09-28T04:59:59.955Z" },
+      sevenDay: { usedPercent: 100, resetsAt: "2099-01-01T04:59:59.955Z" },
     };
     const failed = {
       checkedAt: "2026-09-28T17:00:00.000Z",
@@ -107,7 +107,7 @@ describe("AIToolState", () => {
     usageProbe.mockResolvedValueOnce({
       checkedAt: "2026-09-28T17:05:00.000Z",
       source: "test",
-      sevenDay: { usedPercent: 2, resetsAt: "2026-10-05T04:59:59.955Z" },
+      sevenDay: { usedPercent: 2, resetsAt: "2099-01-08T04:59:59.955Z" },
     });
     const state = createAIToolState({
       probes: probes({
@@ -124,12 +124,20 @@ describe("AIToolState", () => {
 
       await state.refresh(provider);
       expect(current().usage).toEqual(failed);
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        await state.refresh(provider);
-        expect(current().usage?.error).toBeTruthy();
-        expect(current().usage?.sevenDay).toBeUndefined();
-        expect(current().quotaExhausted).toBe(true);
-      }
+      expect(current().quotaExhausted).toBe(true);
+
+      // No usage source is not a failure: no bars and no error.
+      await state.refresh(provider);
+      expect(current().usage).toBeUndefined();
+      expect(current().quotaExhausted).toBe(true);
+
+      await state.refresh(provider);
+      expect(current().usage?.error).toBe("usage timed out");
+      expect(current().quotaExhausted).toBe(true);
+
+      await state.refresh(provider);
+      expect(current().usage).toEqual(failed);
+      expect(current().quotaExhausted).toBe(true);
 
       await state.refresh(provider);
       expect(current().usage?.error).toBeUndefined();

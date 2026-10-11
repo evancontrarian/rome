@@ -70,24 +70,29 @@ function applyUsage(
   target: ProviderState,
   result: PromiseSettledResult<AIToolUsageStatus | null>,
 ): void {
-  if (result.status === "fulfilled" && result.value && !result.value.error) {
-    target.usage = result.value;
-    target.quotaExhausted = usageShowsExhaustion(result.value);
+  // Unknown usage is not fresh capacity or proof of exhaustion, so the failure
+  // branches keep quotaExhausted until a successful probe but drop old bars.
+  if (result.status === "rejected") {
+    target.usage = {
+      checkedAt: new Date().toISOString(),
+      source: "usage probe",
+      error: getErrorMessage(result.reason),
+    };
     return;
   }
-
-  const usage = result.status === "fulfilled" ? result.value : null;
-  // A failed probe is unknown usage, not fresh capacity or proof of exhaustion.
-  // Keep the quota signal until a successful probe, but never present old bars.
-  target.usage = {
-    checkedAt: usage?.checkedAt ?? new Date().toISOString(),
-    source: usage?.source ?? "usage probe",
-    error:
-      usage?.error ??
-      (result.status === "rejected"
-        ? getErrorMessage(result.reason)
-        : "Usage probe returned no data"),
-  };
+  const usage = result.value;
+  if (!usage) {
+    // Null means no usage source, such as a Claude token held in the macOS
+    // Keychain, so there is nothing to show and no failure to report.
+    delete target.usage;
+    return;
+  }
+  if (usage.error) {
+    target.usage = { checkedAt: usage.checkedAt, source: usage.source, error: usage.error };
+    return;
+  }
+  target.usage = usage;
+  target.quotaExhausted = usageShowsExhaustion(usage);
 }
 
 const CODEX_FULL_MODEL_ACCESS_PLANS = new Set<CodexPlanType>([
