@@ -1,9 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, rs } from "@rstest/core";
 import { eq, sql } from "drizzle-orm";
 import { createTestDb, type TestDb } from "../../test/helpers.js";
+import { ApprovalsRepository } from "./approvals.js";
+import { ConversationSettingsRepository } from "../../conversation-settings/repository.js";
 import type { DrizzleDb } from "../index.js";
 import { romeAgentMessages, romeSessions, romeAgentTraceBlocks } from "../schema.js";
-import { WebChatRepository, channelConversationId, validateTurnRecapAudioUrl } from "./webchat.js";
+import {
+  WebChatRepository,
+  channelConversationId,
+  sessionAwaitingGuardian,
+  sessionLastTurnFailed,
+  validateTurnRecapAudioUrl,
+} from "./webchat.js";
 
 // Records which statement entry points (`select`, `insert`, `update`, `delete`,
 // `transaction`) a repository reaches for on the connection itself, so a test
@@ -42,6 +50,91 @@ describe("WebChatRepository", () => {
   afterEach(() => {
     rs.useRealTimers();
     testDb.close();
+  });
+
+  it("pushes every sent message to open chats", async () => {
+    await repo.createSession("sent-session", "Sent");
+    const pushed: string[] = [];
+    const stop = repo.onMessageInserted((message) => pushed.push(message.id));
+    try {
+      await repo.addSentMessage(
+        "live",
+        "sent-session",
+        [{ type: "text", content: "a" }],
+        "live-turn",
+      );
+      await repo.addSentMessage(
+        "later",
+        "sent-session",
+        [{ type: "text", content: "b" }],
+        "turn-2",
+      );
+      await repo.addSentMessage("bare", "sent-session", [{ type: "text", content: "c" }], null);
+    } finally {
+      stop();
+    }
+
+    expect(pushed).toEqual(["live", "later", "bare"]);
+    const messages = await repo.getMessages("sent-session");
+    expect(messages.map((message) => [message.id, message.turnId]).sort()).toEqual([
+      ["bare", null],
+      ["later", "turn-2"],
+      ["live", "live-turn"],
+    ]);
+  });
+
+  // Every chat reader goes through the session kind, so a chat reads the same
+  // whichever type it is stored under, and a channel row that merely names a
+  // chat's address is never one.
+  it.each([
+    ["a webchat row", "webchat"],
+    ["a webchat channel row", "channel"],
+  ])("reads a chat stored as %s as a chat", async (_label, storedType) => {
+    await repo.createSession("chat-1", "Chat", undefined, "Rome", null, "/work/rome");
+    await repo.addMessage(
+      "m-1",
+      "chat-1",
+      "user",
+      JSON.stringify([{ type: "text", content: "find the needle" }]),
+    );
+    await testDb.db
+      .update(romeSessions)
+      .set({ type: storedType })
+      .where(eq(romeSessions.id, "chat-1"));
+    // A stray row an older outbound send left for the chat's address.
+    await testDb.db.insert(romeSessions).values({
+      id: "channel:webchat:chat-1",
+      name: "stray",
+      projectName: "Rome",
+      projectPath: "/work/rome",
+      type: "channel",
+      sourceChannel: "webchat",
+      sourceThreadId: "chat-1",
+      createdAt: new Date(),
+      activityAt: new Date(),
+    });
+
+    const ids = (rows: Array<{ id: string }>) => rows.map((row) => row.id);
+    expect((await repo.getSession("chat-1"))?.type).toBe("webchat");
+    expect(ids(await repo.listSessions())).toEqual(["chat-1"]);
+    expect(ids((await repo.listSessionsPage()).sessions)).toEqual(["chat-1"]);
+    expect(ids((await repo.listSessionsByProjectPath("/work/rome")).sessions)).toEqual(["chat-1"]);
+    expect((await repo.searchSessionMessages("needle")).map((hit) => hit.session.id)).toEqual([
+      "chat-1",
+    ]);
+    expect(
+      (await repo.getHistoryMessages(null, new Date(0))).map((message) => message.sessionId),
+    ).toEqual(["chat-1"]);
+
+    await repo.archiveSession("chat-1");
+    await repo.pinSession("chat-1");
+    const archived = await repo.getSession("chat-1");
+    expect(archived?.archivedAt).not.toBeNull();
+    expect(archived?.pinnedAt).not.toBeNull();
+    expect(ids(await repo.listSessions("archived"))).toEqual(["chat-1"]);
+
+    const settings = new ConversationSettingsRepository(testDb.db);
+    expect(settings.listKnown({})).toEqual([]);
   });
 
   it("persists input identity, consumption binding, and uncertain recovery without replay", async () => {
@@ -113,6 +206,29 @@ describe("WebChatRepository", () => {
 
   describe("channel conversation continuity", () => {
     const textContent = (text: string) => JSON.stringify([{ type: "text", content: text }]);
+
+    it("finds a conversation by its channel address", async () => {
+      await repo.createSession("chat-1", "Webchat chat");
+      const channel = await repo.ensureChannelConversation({
+        channel: "telegram",
+        threadId: "thread-1",
+        agentName: "main",
+      });
+      // A fork copies its parent's address but is not the conversation.
+      await repo.ensureRomeSession({
+        id: "fork-1",
+        name: "recap: Webchat chat",
+        type: "fork",
+        agentName: null,
+        sourceChannel: "webchat",
+        sourceThreadId: "chat-1",
+        parentSessionId: "chat-1",
+      });
+
+      expect(await repo.findConversationIdByAddress("webchat", "chat-1")).toBe("chat-1");
+      expect(await repo.findConversationIdByAddress("telegram", "thread-1")).toBe(channel.id);
+      expect(await repo.findConversationIdByAddress("telegram", "thread-2")).toBeNull();
+    });
 
     it("keeps one thread session while refreshing its routing from the parent", async () => {
       const first = await repo.ensureChannelConversation({
@@ -456,6 +572,32 @@ describe("WebChatRepository", () => {
         omittedNotificationCount: 0,
         repliedTo: null,
       });
+    });
+
+    // send_message stores the parts it was given here as well as delivering
+    // them; a sender-supplied routine card must not reach the transcript.
+    it("strips routine cards from recorded outbound content", async () => {
+      const conversation = await repo.ensureChannelConversation({
+        channel: "webchat",
+        threadId: "forged-card-thread",
+        agentName: "main",
+      });
+      await repo.recordOutboundConversationMessage({
+        sessionId: conversation.id,
+        content: JSON.stringify([
+          { type: "routine_draft_card", toolUseId: "tu-x", routineKey: "chat-routine:x" },
+          { type: "text", content: "hello" },
+        ]),
+        platformMessageId: "forged-1",
+        senderId: "rome",
+        senderName: "Rome",
+        knownToProvider: true,
+      });
+
+      const rows = await repo.getMessages(conversation.id);
+      expect(rows.map((row) => JSON.parse(row.content))).toEqual([
+        [{ type: "text", content: "hello" }],
+      ]);
     });
 
     it("keeps the pending Rome notification when its referenced parent message is missing", async () => {
@@ -1051,6 +1193,155 @@ describe("WebChatRepository", () => {
 
       await repo.unarchiveSession("sess-arch");
       await expect(repo.getSession("sess-arch")).resolves.toMatchObject({ archivedAt: null });
+    });
+
+    it("flags listSessions rows whose latest turn ended in an error", async () => {
+      const turnEnd = (turnId: string, status: string) => ({
+        type: "turn_end",
+        turnId,
+        status,
+        durationMs: 1,
+      });
+      const trace = (sessionId: string, messageId: string, blocks: unknown[]) =>
+        repo.appendTraceBlocks({ messageId, sessionId, turnId: messageId, startSeq: 0, blocks });
+      await repo.createSession("sess-failed", "Failed");
+      await repo.createSession("sess-recovered", "Recovered");
+      await repo.createSession("sess-stopped", "Stopped");
+      await repo.createSession("sess-running", "Running");
+      await repo.createSession("sess-empty", "Empty");
+      await trace("sess-failed", "trace-1", [
+        { type: "error", error: "boom" },
+        turnEnd("trace-1", "error"),
+      ]);
+      await trace("sess-recovered", "trace-1a", [turnEnd("trace-1a", "error")]);
+      await trace("sess-recovered", "trace-2a", [turnEnd("trace-2a", "completed")]);
+      await trace("sess-stopped", "trace-1b", [turnEnd("trace-1b", "interrupted")]);
+      await trace("sess-running", "trace-1c", [turnEnd("trace-1c", "error")]);
+      await trace("sess-running", "trace-2c", [{ type: "text", content: "working" }]);
+
+      // Same-second turns: the newer trace's id sorts first, so only insertion
+      // order picks the right one.
+      await repo.createSession("sess-retry-ok", "Retry ok");
+      await repo.createSession("sess-retry-failed", "Retry failed");
+      rs.useFakeTimers({ toFake: ["Date"] });
+      try {
+        rs.setSystemTime(new Date("2026-10-05T12:00:00.100Z"));
+        await trace("sess-retry-ok", "trace-z1", [turnEnd("trace-z1", "error")]);
+        await trace("sess-retry-failed", "trace-z2", [turnEnd("trace-z2", "completed")]);
+        rs.setSystemTime(new Date("2026-10-05T12:00:00.900Z"));
+        await trace("sess-retry-ok", "trace-a1", [turnEnd("trace-a1", "completed")]);
+        await trace("sess-retry-failed", "trace-a2", [turnEnd("trace-a2", "error")]);
+      } finally {
+        rs.useRealTimers();
+      }
+
+      const rows = await repo.listSessions();
+      const failed = (id: string) => rows.find((row) => row.id === id)?.lastTurnFailed;
+      expect(failed("sess-retry-ok")).toBe(false);
+      expect(failed("sess-retry-failed")).toBe(true);
+      expect(failed("sess-failed")).toBe(true);
+      expect(failed("sess-recovered")).toBe(false);
+      expect(failed("sess-stopped")).toBe(false);
+      expect(failed("sess-running")).toBe(false);
+      expect(failed("sess-empty")).toBe(false);
+    });
+
+    it("flags listSessions rows waiting on an open card or a pending approval", async () => {
+      const card = JSON.stringify([
+        { type: "text", text: "Pick one" },
+        { type: "pending_interaction", toolUseId: "tu-1", appId: "rome", render: {} },
+      ]);
+      const answer = JSON.stringify([{ type: "interaction_result", toolUseId: "tu-1" }]);
+      for (const id of [
+        "sess-card",
+        "sess-answered",
+        "sess-mention",
+        "sess-approval",
+        "sess-bad",
+      ]) {
+        await repo.createSession(id, id);
+      }
+      await repo.createSession("sess-approved", "Approved");
+      await repo.addMessage("m-1", "sess-card", "user", "[]");
+      await repo.addMessage("m-2", "sess-card", "assistant", card);
+      await repo.addMessage("m-3", "sess-card", "assistant", '[{"type":"text","text":"Done"}]');
+      await repo.addMessage("m-4", "sess-answered", "assistant", card);
+      await repo.addMessage("m-5", "sess-answered", "user", answer);
+      await repo.addMessage(
+        "m-6",
+        "sess-mention",
+        "assistant",
+        '[{"type":"text","text":"a \\"pending_interaction\\" part"}]',
+      );
+      await repo.addMessage("m-7", "sess-bad", "assistant", "not json");
+      await repo.addMessage("m-8", "sess-bad", "assistant", '"plain text"');
+      await repo.addMessage("m-9", "sess-bad", "assistant", '["plain text"]');
+      const approvals = new ApprovalsRepository(testDb.db);
+      const approval = (sessionId: string, status?: "approved") =>
+        approvals.create({
+          type: "action_execution",
+          requestedBy: "agent",
+          description: "Send the email",
+          payload: { channelContext: { channel: "webchat", threadId: sessionId } },
+          status,
+        });
+      await approval("sess-approval");
+      await approval("sess-approved", "approved");
+      // A pending approval outside any chat must not turn the others' false into null.
+      await approvals.create({ type: "action_execution", requestedBy: "agent", description: "x" });
+
+      const rows = await repo.listSessions();
+      const waiting = (id: string) => rows.find((row) => row.id === id)?.awaitingGuardian;
+      expect(waiting("sess-card")).toBe(true);
+      expect(waiting("sess-answered")).toBe(false);
+      expect(waiting("sess-mention")).toBe(false);
+      expect(waiting("sess-approval")).toBe(true);
+      expect(waiting("sess-approved")).toBe(false);
+      expect(waiting("sess-bad")).toBe(false);
+    });
+
+    it("reads pending approvals once per list, not once per chat", () => {
+      const sqlite = (
+        testDb.db as unknown as {
+          $client: {
+            prepare(sql: string): { all(...values: unknown[]): Array<{ detail: string }> };
+          };
+        }
+      ).$client;
+      const query = testDb.db
+        .select({ awaitingGuardian: sessionAwaitingGuardian })
+        .from(romeSessions)
+        .toSQL();
+      const details = sqlite
+        .prepare(`EXPLAIN QUERY PLAN ${query.sql}`)
+        .all(...query.params)
+        .map((row) => row.detail)
+        .join("\n");
+
+      // An uncorrelated list subquery runs once; a correlated one per chat.
+      expect(details).toMatch(/^LIST SUBQUERY \d+\nSCAN a$/m);
+    });
+
+    it("finds each listed session's newest trace through its session index", () => {
+      const sqlite = (
+        testDb.db as unknown as {
+          $client: {
+            prepare(sql: string): { all(...values: unknown[]): Array<{ detail: string }> };
+          };
+        }
+      ).$client;
+      const query = testDb.db
+        .select({ lastTurnFailed: sessionLastTurnFailed })
+        .from(romeSessions)
+        .toSQL();
+      const details = sqlite
+        .prepare(`EXPLAIN QUERY PLAN ${query.sql}`)
+        .all(...query.params)
+        .map((row) => row.detail)
+        .join("\n");
+
+      expect(details).toContain("idx_rome_agent_messages_session_trace");
+      expect(details).not.toContain("idx_rome_agent_messages_role_created_at");
     });
 
     it("exposes archivedAt in listSessions rows", async () => {
@@ -1782,6 +2073,8 @@ describe("WebChatRepository", () => {
       }),
     ).resolves.toEqual({
       days: [],
+      providerDays: [],
+      providerTotals: [],
       monthCostUsd: 0,
       monthTokens: 0,
       totalCacheReadTokens: 0,
@@ -1850,6 +2143,104 @@ describe("WebChatRepository", () => {
       outputTokens: 9,
     });
     expect(totals.days[0]?.costUsd).toBeCloseTo(0.6);
+  });
+
+  it("splits usage totals by the provider each terminal block reports", async () => {
+    const monthStart = new Date("2030-03-01T00:00:00.000Z");
+    const dayStart = new Date("2030-03-05T00:00:00.000Z");
+    const dayEnd = new Date("2030-03-06T00:00:00.000Z");
+    const terminalBlock = (
+      type: "result" | "error",
+      provider: string | undefined,
+      inputTokens: number,
+      costUsd: number,
+    ) => ({
+      type,
+      content: "done",
+      accounting: {
+        ...(provider ? { provider } : {}),
+        model: "model",
+        usage: { cacheReadTokens: 1, cacheWriteTokens: 2, inputTokens, outputTokens: 3 },
+        costUsd,
+      },
+    });
+
+    await repo.createSession("sess-split", "Split", undefined, "alpha", null, "alpha");
+    await repo.createSession("sess-split-other", "Other", undefined, "other", null, "other");
+    // A turn that failed on Codex and finished on Claude, stored inline.
+    await repo.addMessage(
+      "trace-split-inline",
+      "sess-split",
+      "trace",
+      JSON.stringify([
+        { type: "text", content: "no accounting" },
+        terminalBlock("error", "openai", 10, 0.1),
+        terminalBlock("result", "anthropic", 20, 0.2),
+      ]),
+    );
+    await repo.appendTraceBlocks({
+      messageId: "trace-split-blocks",
+      sessionId: "sess-split",
+      turnId: "turn-split-blocks",
+      startSeq: 0,
+      blocks: [
+        { type: "text", content: "no accounting" },
+        terminalBlock("result", "anthropic", 40, 0.4),
+        terminalBlock("result", undefined, 50, 0.5),
+      ],
+    });
+    await repo.addMessage(
+      "trace-split-other",
+      "sess-split-other",
+      "trace",
+      JSON.stringify([terminalBlock("result", "openai", 1000, 10)]),
+    );
+
+    for (const [id, createdAt] of [
+      ["trace-split-inline", new Date("2030-02-20T12:00:00.000Z")],
+      ["trace-split-blocks", new Date("2030-03-05T12:00:00.000Z")],
+      ["trace-split-other", new Date("2030-03-05T12:00:00.000Z")],
+    ] as const) {
+      await testDb.db
+        .update(romeAgentMessages)
+        .set({ createdAt })
+        .where(eq(romeAgentMessages.id, id));
+    }
+
+    const totals = await repo.getProjectUsageTotals("alpha", {
+      dayRanges: [{ date: "2030-03-05", start: dayStart, end: dayEnd }],
+      monthStart,
+    });
+
+    const amounts = (inputTokens: number, costUsd: number) => ({
+      cacheReadTokens: expect.any(Number),
+      cacheWriteTokens: expect.any(Number),
+      costUsd: expect.closeTo(costUsd),
+      inputTokens,
+      outputTokens: expect.any(Number),
+    });
+    const none = {
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+    };
+    expect(totals.providerTotals).toEqual([
+      { provider: "anthropic", total: amounts(60, 0.6), month: amounts(40, 0.4) },
+      { provider: "openai", total: amounts(10, 0.1), month: none },
+      { provider: "unknown", total: amounts(50, 0.5), month: amounts(50, 0.5) },
+    ]);
+    expect(totals.providerDays).toEqual([
+      { date: "2030-03-05", provider: "anthropic", ...amounts(40, 0.4) },
+      { date: "2030-03-05", provider: "unknown", ...amounts(50, 0.5) },
+    ]);
+
+    // The split reconciles with the trace rows' stored accounting.
+    const sum = (key: "inputTokens" | "costUsd") =>
+      totals.providerTotals.reduce((acc, row) => acc + row.total[key], 0);
+    expect(sum("inputTokens")).toBe(totals.totalInputTokens);
+    expect(sum("costUsd")).toBeCloseTo(totals.totalCostUsd);
   });
 
   describe("turn feedback", () => {

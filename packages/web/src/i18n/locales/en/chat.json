@@ -108,7 +108,6 @@
     "emptyList": "(empty list)",
     "emptyObject": "(empty object)",
     "agentRunFailed": "Agent run failed",
-    "unknownTool": "unknown",
     "showMore": "Show more",
     "showLess": "Show less",
     "input": "Input",
@@ -147,6 +146,11 @@
       "title": "No AI provider is available",
       "description": "Connect an AI tool or review its current status."
     },
+    "creditsUsedUp": {
+      "title": "Rome credits used up",
+      "description": "Connect ChatGPT or Claude, or choose a model from one already connected.",
+      "action": "Connect an AI"
+    },
     "openAiTools": "Open AI Tools"
   },
   "usage": {
@@ -177,9 +181,11 @@
       "cacheWrite": "Cache write",
       "input": "Input",
       "output": "Output",
+      "reasoning": "Reasoning",
       "context": "Context",
       "mainContext": "Main context"
-    }
+    },
+    "reasoningHint": "Included in output. Some providers report an estimate, and a total counts only the runs that report it."
   },
   "approvals": {
     "headerPending": "Guardian approval needed",
@@ -221,6 +227,13 @@
     "uploadFiles": "Upload files",
     "dropFiles": "Drop files to upload",
     "removeFile": "Remove {{name}}",
+    "zoomIn": "Zoom in",
+    "zoomOut": "Zoom out",
+    "resetZoom": "Reset",
+    "zoomLevel": "Zoom",
+    "previewImage": "Preview",
+    "playVideo": "Play",
+    "closeImagePreview": "Close",
     "filePill": "#File {{index}}",
     "uploadProgressFor": "Upload progress for {{name}}",
     "cancelUpload": "Cancel",
@@ -250,7 +263,16 @@
     "connectedSummary": "Connected an AI",
     "skippedSummary": "Skipped connecting an AI",
     "connectedTitle": "AI connected",
-    "checking": "Checking your AI connections…"
+    "checking": "Checking your AI connections…",
+    "credits": {
+      "title": "Start with free Rome credits",
+      "hint": "Your account has {{amount}} in Rome credits, so I can start now. Sign in to Claude or ChatGPT any time to use your own subscription instead.",
+      "continue": "Continue with credits",
+      "summary": "Continued with Rome credits",
+      "usingTitle": "Using Rome credits",
+      "using": "Rome credits in use",
+      "ready": "Rome credits ready"
+    }
   },
   "modelSelector": {
     "label": "Model",
@@ -269,6 +291,7 @@
       "haiku": "Haiku",
       "fable": "Fable",
       "gpt6Astra": "GPT-6 Astra",
+      "gpt61Sol": "GPT-6.1 Sol",
       "gpt6Sol": "GPT-6 Sol",
       "gpt6Luna": "GPT-6 Luna",
       "gpt56Sol": "GPT-5.6 Sol",
@@ -355,7 +378,6 @@
       "sendStatus": "Failed to send message ({{status}}).",
       "sendInvalidResponse": "Failed to send message: invalid response.",
       "sendFallback": "Failed to send message.",
-      "attachStreamStatus": "Failed to attach stream for turn {{turnId}} ({{status}}).",
       "stopFallback": "Failed to stop generation.",
       "stopStatus": "Stop failed ({{status}})."
     }

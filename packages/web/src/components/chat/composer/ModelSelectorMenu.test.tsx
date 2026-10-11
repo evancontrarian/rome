@@ -8,10 +8,6 @@ import { LARGE_MODEL_OPTIONS } from "@/lib/chat-constants";
 
 beforeAll(async () => {
   await i18n.changeLanguage("en");
-  Element.prototype.hasPointerCapture = () => false;
-  Element.prototype.setPointerCapture = () => {};
-  Element.prototype.releasePointerCapture = () => {};
-  Element.prototype.scrollIntoView = () => {};
 });
 
 afterEach(cleanup);
@@ -81,6 +77,18 @@ describe("ModelSelectorMenu", () => {
       expect(names).toContain("Sonnet");
       expect(names).not.toContain("Auto");
     });
+  });
+
+  it("finds GPT-6.1 Sol and submits its model selection ID", async () => {
+    const user = userEvent.setup();
+    const props = baseProps();
+    render(<ModelSelectorMenu {...props} />);
+
+    await user.type(screen.getByPlaceholderText("Search models…"), "6.1");
+    await user.click(await screen.findByRole("option", { name: "GPT-6.1 Sol" }));
+
+    expect(props.onChange).toHaveBeenCalledWith("gpt-6-1-sol");
+    expect(props.onOpenChange).toHaveBeenCalledWith(false);
   });
 
   it("shows an empty state when nothing matches", async () => {

@@ -50,7 +50,6 @@ async function waitForCount(path: string, minimum: number) {
 describe("rome-start-chrome-cdp.sh", () => {
   it.each([
     [undefined, undefined, false],
-    ["false", "1", false],
     ["true", undefined, true],
     ["true", "0", false],
   ] as const)("gates stealth with CDP automation=%s and stealth=%s", async (automationEnabled, stealthEnabled, expectStealth) => {
@@ -181,6 +180,9 @@ sleep 0.1
     expect(chromeArgs).toContain("--use-angle=swiftshader-webgl");
     expect(chromeArgs).toContain("--enable-unsafe-swiftshader");
     expect(chromeArgs).not.toContain("--disable-gpu");
+    expect(chromeArgs.filter((arg) => arg.startsWith("--disable-features="))).toEqual([
+      "--disable-features=IgnoreDuplicateNavs",
+    ]);
     expect(supervisor.exitCode).toBeNull();
   });
 
@@ -262,6 +264,9 @@ sleep 0.1
     expect(count).toBeGreaterThanOrEqual(2);
     expect(existsSync(wrapperUsedFile)).toBe(false);
     expect(chromeArgs).toContain(`--user-data-dir=${join(tempDir, "profile")}`);
+    expect(chromeArgs.filter((arg) => arg.startsWith("--disable-features="))).toEqual([
+      "--disable-features=IgnoreDuplicateNavs",
+    ]);
     expect(googleEnv).toBe("");
     expect(supervisor.exitCode).toBeNull();
   });

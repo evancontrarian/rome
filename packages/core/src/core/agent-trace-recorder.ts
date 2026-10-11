@@ -8,11 +8,14 @@ import type {
   RomeAgentTraceTriggerMetadata,
   WebChatRepository,
 } from "../db/repositories/webchat.js";
-import type { AgentMessage, MessagePart } from "../types.js";
+import type { AgentEvent, MessagePart } from "../types.js";
 import type { ThreadContext } from "./types.js";
-import { toTraceBlock, type TraceableAgentMessage } from "../api/helpers.js";
-import type { Logger } from "../logger.js";
+import { toTraceEvent, type TraceableEvent } from "../api/helpers.js";
+import { createLogger, type Logger } from "../logger.js";
 import { isCoreMainAgentId } from "../apps/artifact-id.js";
+import { isTransientDelta } from "./agent-message.js";
+
+const log = createLogger("agent-trace-recorder");
 
 export interface AgentTraceRecorderInput {
   webchatRepo: WebChatRepository;
@@ -57,9 +60,7 @@ export function resolveRomeSessionId(input: RomeSessionIdInput): string {
   if (input.romeSessionId) return input.romeSessionId;
   if (input.existingSessionId) return input.existingSessionId;
   if (input.threadContext) {
-    if (input.threadContext.channel === "webchat") {
-      return input.threadContext.threadId;
-    }
+    if (input.threadContext.romeSessionId) return input.threadContext.romeSessionId;
     return `channel:${input.threadContext.channel}:${input.threadContext.threadId}`;
   }
   const actionContext = input.actionContext ?? getCurrentActionContext();
@@ -67,6 +68,103 @@ export function resolveRomeSessionId(input: RomeSessionIdInput): string {
     return `action:${actionContext.executionId}:${input.agentName || "main"}`;
   }
   return `action:${input.channelThreadKey ?? input.agentName}:${input.agentName || "main"}`;
+}
+
+export interface RecordedConversation {
+  id: string;
+  name: string;
+  type: RomeSessionType;
+}
+
+/**
+ * The conversation a session's row recorded, when it still exists. A deleted
+ * conversation leaves its id on the row, and recording under that id would
+ * recreate it.
+ */
+export async function findRecordedConversation(
+  webchatRepo: WebChatRepository | undefined,
+  conversationId: string | undefined,
+): Promise<RecordedConversation | undefined> {
+  if (!webchatRepo || !conversationId) return undefined;
+  let conversation;
+  try {
+    conversation = await webchatRepo.getSession(conversationId);
+  } catch (err) {
+    // The lookup only refines where turns record, so it must not fail the session.
+    log.warn("failed to read a session's recorded conversation", {
+      conversationId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
+  if (!conversation) return undefined;
+  const { id, name, type } = conversation;
+  return { id, name, type: type as RomeSessionType };
+}
+
+/**
+ * The conversation a session serves. A `named` one was passed in by the
+ * caller that opened the session. A `recorded` one is the conversation the
+ * session's row stored, looked up only when no caller named one and only if it
+ * still exists.
+ */
+export type SessionConversation =
+  | { origin: "named"; id: string }
+  | ({ origin: "recorded" } & RecordedConversation);
+
+export interface TurnConversationInput extends RomeSessionIdInput {
+  /** The conversation the session serves, as it stood when the turn started. */
+  sessionConversation?: SessionConversation;
+}
+
+// Conversations whose turns only the recorder writes. A webchat conversation
+// belongs to the webchat route, and a channel one to the inbox, which also
+// injects its pending context on a channel turn.
+const RECORDER_OWNED_CONVERSATION_TYPES: ReadonlySet<RomeSessionType> = new Set([
+  "subagent",
+  "fork",
+]);
+
+/**
+ * The conversation a turn records into, and its type. A conversation the
+ * caller named wins. Otherwise a recorded subagent or fork conversation is
+ * used, and the id is derived as before for anything else. `existing` is true
+ * for a named or recorded conversation, which needs no creating.
+ * `promptPersisted` is true only for a named one, whose caller owns the prompt.
+ * `recorderOwned` is true for a recorded one, which only the recorder writes.
+ *
+ * A turn under a thread stays with that thread's conversation, as before. Its
+ * reply is delivered and recorded there under the turn's id, so the trace has
+ * to be found there too, and a webchat card is answered by looking its turn up
+ * in that chat. That covers backend and approval turns on a subagent or side
+ * chat.
+ */
+export function resolveTurnConversation(input: TurnConversationInput): {
+  romeSessionId: string;
+  romeSessionType: RomeSessionType;
+  existing: boolean;
+  promptPersisted: boolean;
+  recorderOwned: boolean;
+} {
+  const conversation = input.sessionConversation;
+  // The opener's named conversation wins over the one this turn's caller names.
+  const named = conversation?.origin === "named" ? conversation.id : input.romeSessionId;
+  const found = !named && conversation?.origin === "recorded" ? conversation : undefined;
+  const ownedByRecorder =
+    found !== undefined &&
+    RECORDER_OWNED_CONVERSATION_TYPES.has(found.type) &&
+    !input.threadContext;
+  const recorded = ownedByRecorder ? found : undefined;
+  return {
+    romeSessionId: resolveRomeSessionId({
+      ...input,
+      romeSessionId: named ?? recorded?.id,
+    }),
+    romeSessionType: recorded?.type ?? resolveRomeSessionType(input),
+    existing: Boolean(named ?? recorded),
+    promptPersisted: Boolean(named),
+    recorderOwned: Boolean(recorded),
+  };
 }
 
 export function resolveRomeSessionType(
@@ -84,18 +182,18 @@ export class AgentTraceRecorder {
 
   constructor(private input: AgentTraceRecorderInput) {}
 
-  async record(msg: AgentMessage & { agent?: string }): Promise<void> {
+  async record(msg: AgentEvent & { agent?: string }): Promise<void> {
     await this.recordBatch([msg], this.seq);
   }
 
   async recordBatch(
-    messages: (AgentMessage & { agent?: string })[],
+    messages: (AgentEvent & { agent?: string })[],
     startSeq = this.seq,
   ): Promise<void> {
     const blocks = messages.flatMap((msg) =>
-      msg.type === "text_delta" || msg.type === "input_status"
+      isTransientDelta(msg) || msg.type === "input_status"
         ? []
-        : [toTraceBlock(msg as TraceableAgentMessage & { agent?: string })],
+        : [toTraceEvent(msg as TraceableEvent & { agent?: string })],
     );
     if (blocks.length === 0) return;
     await this.ensureSession();
@@ -184,7 +282,7 @@ export class AgentTraceRecorder {
 
   private transcriptMessages(
     sessionId: string,
-    messages: (AgentMessage & { agent?: string })[],
+    messages: (AgentEvent & { agent?: string })[],
   ): RomeAgentTranscriptMessageInput[] {
     if (!this.shouldPersistTranscript()) return [];
     const rows: RomeAgentTranscriptMessageInput[] = [];
@@ -248,7 +346,7 @@ function transcriptMessageId(
 
 export async function recordAgentTraceBestEffort(
   recorder: AgentTraceRecorder | null,
-  msg: AgentMessage & { agent?: string },
+  msg: AgentEvent & { agent?: string },
   log: Pick<Logger, "warn">,
   context: { turnId: string; source: string },
 ): Promise<void> {

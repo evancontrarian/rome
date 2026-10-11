@@ -13,11 +13,12 @@ export interface WidgetPlacement {
   // reload. Set by an agent's `show_app`/`place_widget`.
   route?: string;
   params?: Record<string, string | number | boolean>;
-  // Selected file for a `projects` widget — the file the user (or an agent
-  // link) last opened. Persists with the layout so the addressed file survives
-  // reload; the embedded file browser disables its own URL-as-SSOT sync, so
-  // without this the selection is lost on refresh. A `projects/`-rooted logical
-  // path, matching the browser's own selection space.
+  // Selected file or folder for a `projects` widget — wherever the user (or an
+  // agent link) last navigated. Persists with the layout so the addressed spot
+  // survives reload and rides the open-in-new-tab link; the embedded file
+  // browser disables its own URL-as-SSOT sync, so without this the selection is
+  // lost on refresh. A `projects/`-rooted logical path, matching the browser's
+  // own selection space.
   selectedPath?: string;
 }
 
@@ -253,38 +254,72 @@ export function placeChatWidget(sessionId: string): string {
   return id;
 }
 
+// One tile per app. A repeat placement retargets the existing tile to the new
+// route/params rather than stacking a duplicate: keep its grid position
+// (`order`) so it doesn't jump, but mint a fresh id so the iframe remounts at
+// the new src.
+function withAppPlacement(
+  placements: WidgetPlacement[],
+  seed: Omit<Extract<WidgetSeed, { type: "app" }>, "type">,
+): { placements: WidgetPlacement[]; id: string } {
+  const existing = placements.find((p) => p.type === "app" && p.targetId === seed.appId);
+  const order = existing ? existing.order : nextOrder(placements);
+  const kept = existing ? placements.filter((p) => p.id !== existing.id) : placements;
+  const id = genId();
+  return {
+    id,
+    placements: [
+      ...kept,
+      {
+        id,
+        type: "app",
+        targetId: seed.appId,
+        order,
+        ...(seed.route !== undefined ? { route: seed.route } : {}),
+        ...(seed.params !== undefined ? { params: seed.params } : {}),
+      },
+    ],
+  };
+}
+
 export function autoPlaceApp(
   appId: string,
   route?: string,
   params?: Record<string, string | number | boolean>,
   activate = false,
 ): string {
-  let current = getSnapshot();
+  const next = withAppPlacement(getSnapshot(), { appId, route, params });
+  persist(next.placements);
+  if (activate) selectTool(next.id);
+  return next.id;
+}
 
-  // One tile per app. A repeat call retargets the existing tile to the new
-  // route/params rather than stacking a duplicate: keep its grid position
-  // (`order`) so it doesn't jump, but mint a fresh id so the iframe remounts
-  // at the new src.
-  const existing = current.find((p) => p.type === "app" && p.targetId === appId);
-  const order = existing ? existing.order : nextOrder(current);
-  if (existing) {
-    current = current.filter((p) => p.id !== existing.id);
-  }
+// Agent placements already applied: the tile each one mounted, keyed by layout
+// session and the server's `placementId`. Module scope so the record outlives
+// a Chat remount; keyed by layout because a placement applied in one session's
+// layout is still missing from another's.
+const appliedAgentPlacements = new Map<string, string>();
 
-  const id = genId();
-  persist([
-    ...current,
-    {
-      id,
-      type: "app",
-      targetId: appId,
-      order,
-      ...(route !== undefined ? { route } : {}),
-      ...(params !== undefined ? { params } : {}),
-    },
-  ]);
-  if (activate) selectTool(id);
-  return id;
+/**
+ * Apply an agent's `widget_placement` to the active layout. A resumed turn
+ * stream replays each app's latest placement, and applying it again would
+ * remount the widget and drop the guardian's navigation inside it, so a replay
+ * is skipped while the tile it mounted is still in the layout. If the tile is
+ * gone, for example because a layout load replaced a save that never reached
+ * the server, the replay places it again. A placement without an id always
+ * applies.
+ */
+export function applyAgentPlacement(
+  placementId: string | undefined,
+  appId: string,
+  route?: string,
+  params?: Record<string, string | number | boolean>,
+): void {
+  const key = placementId ? JSON.stringify([activeSessionId, placementId]) : null;
+  const appliedTileId = key ? appliedAgentPlacements.get(key) : undefined;
+  if (appliedTileId && getSnapshot().some((p) => p.id === appliedTileId)) return;
+  const tileId = autoPlaceApp(appId, route, params);
+  if (key) appliedAgentPlacements.set(key, tileId);
 }
 
 export function placeWidgets(widgets: readonly WidgetSeed[]): void {
@@ -296,20 +331,7 @@ export function placeWidgets(widgets: readonly WidgetSeed[]): void {
   for (const widget of widgets) {
     if (widget.type === "app") {
       if (!widget.appId) continue;
-      const existing = current.find((p) => p.type === "app" && p.targetId === widget.appId);
-      const order = existing ? existing.order : nextOrder(current);
-      if (existing) current = current.filter((p) => p.id !== existing.id);
-      current = [
-        ...current,
-        {
-          id: genId(),
-          type: "app",
-          targetId: widget.appId,
-          order,
-          ...(widget.route !== undefined ? { route: widget.route } : {}),
-          ...(widget.params !== undefined ? { params: widget.params } : {}),
-        },
-      ];
+      current = withAppPlacement(current, widget).placements;
       changed = true;
       continue;
     }
@@ -349,9 +371,15 @@ export function placeWidgets(widgets: readonly WidgetSeed[]): void {
   if (changed) persist(current);
 }
 
+/**
+ * Place a navigation's widget handoff and make the last one the active tab.
+ * `chatFirst` keeps the panel collapsed with that tab marked unread, for
+ * layouts that show one pane at a time where expanding would hide the chat.
+ */
 export function placeWidgetsIfSessionActive(
   sessionId: string | null,
   widgets: readonly WidgetSeed[],
+  { chatFirst = false }: { chatFirst?: boolean } = {},
 ): boolean {
   if (activeSessionId !== sessionId) return false;
   placeWidgets(widgets);
@@ -361,7 +389,17 @@ export function placeWidgetsIfSessionActive(
     snapshot.find(
       (p) => p.type === last.type && (last.type !== "app" || p.targetId === last.appId),
     );
-  if (placed) selectTool(placed.id);
+  if (!placed) return true;
+  if (chatFirst) {
+    saveToolView({
+      activeId: placed.id,
+      collapsed: true,
+      unreadIds: [...toolView.unreadIds.filter((x) => x !== placed.id), placed.id],
+    });
+    notify();
+  } else {
+    selectTool(placed.id);
+  }
   return true;
 }
 
@@ -416,10 +454,10 @@ export function updatePlacementLink(
 }
 
 /**
- * Persist a `projects` tile's currently-selected file back onto its placement
- * so the addressed file survives reload. In place (id unchanged → no remount);
- * no-ops when unchanged to avoid churning localStorage + the server PUT on every
- * click.
+ * Persist a `projects` tile's currently-selected file or folder back onto its
+ * placement so the addressed spot survives reload. In place (id unchanged → no
+ * remount); no-ops when unchanged to avoid churning localStorage + the server
+ * PUT on every click.
  */
 export function updateProjectsSelection(placementId: string, selectedPath: string | null): void {
   const current = getSnapshot();

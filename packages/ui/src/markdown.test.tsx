@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, rs } from "@rstest/core";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { Suspense } from "react";
 import { Markdown, type MarkdownTheme, readMarkdownMermaidTheme } from "./markdown.js";
 
@@ -169,22 +169,58 @@ describe("Markdown", () => {
     expect(container.textContent ?? "").not.toContain("graph TD");
   });
 
-  it("renders inline and block math with KaTeX", () => {
+  it("renders inline and block math with KaTeX once the math plugin loads", async () => {
     const { container } = renderMd(
       "Euler's identity is $$e^{i\\pi} + 1 = 0$$.\n\n$$\nE = mc^2\n$$",
     );
 
-    expect(container.querySelectorAll(".katex")).toHaveLength(2);
+    await waitFor(() => expect(container.querySelectorAll(".katex")).toHaveLength(2));
     expect(container.querySelectorAll(".katex-mathml")).toHaveLength(2);
     expect(container.querySelectorAll(".katex-display")).toHaveLength(1);
   });
 
-  it("does not interpret single dollar signs as math", () => {
-    const { container } = renderMd("The first item costs $5 and the second costs $10.");
+  it("does not interpret single dollar signs as math", async () => {
+    // The $$ loads the math plugin, so the single dollars are parsed with it.
+    const { container } = renderMd(
+      "The first item costs $5 and the second costs $10, unlike $$x$$.",
+    );
 
-    expect(container.querySelector(".katex")).toBeNull();
+    await waitFor(() => expect(container.querySelectorAll(".katex")).toHaveLength(1));
     expect(container.textContent).toContain("$5");
     expect(container.textContent).toContain("$10");
+  });
+
+  it("drops an empty item that ends a list, which would render a bare bullet", () => {
+    for (const md of ["- a\n- b\n-\n", "* a\n* b\n* ", "1. a\n2. b\n3. "]) {
+      const { container, unmount } = renderMd(md);
+      const items = [...container.querySelectorAll("li")].map((li) => li.textContent);
+      expect(items).toEqual(["a", "b"]);
+      unmount();
+    }
+  });
+
+  it("drops a nested list's trailing empty item, and a list left with none", () => {
+    const { container } = renderMd("- a\n  - b\n  -\n\ntext\n\n-\n");
+    // One outer list holding one nested list; the bare `-` after the text
+    // leaves no list of its own.
+    expect(container.querySelectorAll("ul")).toHaveLength(2);
+    expect(container.querySelectorAll("li")).toHaveLength(2);
+    expect(container.querySelector("li li")?.textContent).toBe("b");
+  });
+
+  it("keeps an empty item inside a list", () => {
+    const { container } = renderMd("- a\n-\n- b");
+
+    expect(container.querySelectorAll("li")).toHaveLength(3);
+  });
+
+  it("lets a table grow to its full height instead of scrolling inside a cap", () => {
+    const rows = Array.from({ length: 20 }, (_, i) => `| row ${i} | value ${i} |`).join("\n");
+    const { container } = renderMd(`| Key | Value |\n| --- | --- |\n${rows}`);
+    const scroller = container.querySelector('[data-streamdown="table"]')?.parentElement;
+
+    expect(scroller).not.toBeNull();
+    expect(scroller?.style.maxHeight).toBe("");
   });
 
   it("marks compact mode without changing semantic element roles", () => {

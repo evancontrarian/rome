@@ -16,65 +16,68 @@
  */
 
 import type {
-  ConversationId,
-  InboundMessage,
-  MessageReceipt,
-  OutgoingMessage,
-  TalkInboundMedia,
+  Channel as AppChannel,
+  ChannelInbound,
+  ChannelSend as AppChannelSend,
+  ConversationDescriptor,
+  ChannelDirectMessaging,
 } from "@rome-os/app-runtime";
 import type { AddressBooks } from "./account-fold.js";
 import type { Accounts } from "./accounts.js";
-import type { Messages } from "./messages.js";
+import type { AccountMessages, Messages } from "./messages.js";
 
-/** Sending on a channel. */
-export interface ChannelSend {
-  send(conversationId: ConversationId, message: OutgoingMessage): Promise<MessageReceipt>;
+/** Sending on a channel, as core's channels do it: the SDK's send port, typing
+ *  indicator included, and a way to reach one account directly. */
+export interface ChannelSend extends AppChannelSend {
+  /**
+   * Reaching one account directly rather than replying in a conversation that
+   * exists, or null where the channel cannot. When no Connection
+   * exists for the channel, `conversationFor` rejects with
+   * {@link ChannelNotConnected}, as `send` does. A Connection that exists but
+   * has no live talker (locked, awaiting re-authorization) reads as null.
+   */
+  readonly direct: ChannelDirectMessaging | null;
 }
 
 /**
- * What a subscriber hears from a channel. One kind today; a new kind (an
- * interaction, an edit) joins this union so it passes the same admission as a
- * message, and a handler switching on `kind` keeps compiling.
+ * The conversations a channel can see, for conversation settings. Each
+ * descriptor carries its `ConversationRef`, so a caller addresses a
+ * conversation it found here the way it addresses one an inbound event named.
  */
-export type InboundEvent = { kind: "message"; message: InboundMessage };
+export interface ChannelDirectory {
+  /**
+   * Up to `limit` conversations from the Connection backing the channel, or
+   * none when `connectionId` names another. A read that fails is logged and
+   * answers none.
+   */
+  listConversations(input: {
+    query?: string;
+    limit: number;
+    includeTopics?: boolean;
+    connectionId?: string;
+  }): Promise<ConversationDescriptor[]>;
+}
 
-/**
- * Hearing what arrives on a channel. Every implementation owes all five:
- *
- * - **R1 Admitted only.** The channel's admission runs before any subscriber
- *   hears an event. On a channel that pairs accounts (Telegram, Discord,
- *   Feishu), an account the guardian has not approved never reaches a
- *   subscriber, and neither does a pairing code. Any other channel delivers
- *   every sender, and a subscriber decides what a stranger gets.
- * - **R2 Answerable only.** An event is something a subscriber may answer: not
- *   Rome's own sends, not the guardian's own messages from another device, not
- *   reactions, edits or frames with no text and no attachments. The complete
- *   record is the channel's `messages`.
- * - **R3 Live, at most once.** Nothing is acknowledged or replayed. An event
- *   that arrives with no subscriber, or while the channel is not receiving, is
- *   not delivered later; a subscriber catches up by reading `messages`.
- * - **R4 Fan-out.** Every subscriber hears every event. Events are dispatched
- *   in arrival order and handlers run concurrently, so one slow or failing
- *   handler holds up no other.
- * - **R5 Durable subscription.** A subscription outlives a reconnect of
- *   whatever backs the channel.
- */
-export interface Inbound {
-  subscribe(handler: (event: InboundEvent) => Promise<void>): () => void;
-  /** Materializes a message's attachments, or null when the channel cannot
-   *  now. A consumer without it uses the attachments as delivered. */
-  readonly media: TalkInboundMedia | null;
+/** A send, or a direct-conversation lookup, on a channel nothing backs now. */
+export class ChannelNotConnected extends Error {
+  constructor(readonly channel: string) {
+    super(`No connection backs channel "${channel}"`);
+    this.name = "ChannelNotConnected";
+  }
 }
 
 /**
- * A channel Rome uses.
+ * A channel Rome uses: one of Rome's presences on a platform, such as the
+ * `telegram` bot or the `telegram_user` signed-in account. A second presence is
+ * a second channel, never a second Connection behind this one.
  *
  * The two contracts below are the whole of it. Every channel owes both:
  *
  * - **C1 The name is the identity.** One channel per name, one name per
- *   channel, stable for the life of the deployment. It is the `channel` written
- *   on every link, every stored message and every sentinel row, so the name is
- *   not a label a channel can restyle — changing it reassigns history.
+ *   channel, stable for the life of the deployment. A channel's name is its
+ *   service's, and it is the `channel` written on every link, every stored
+ *   message and every sentinel row. The name is not a label a channel can
+ *   restyle — changing it reassigns history.
  * - **C2 What a channel carries is the channel's.** No port reaches past this
  *   channel's conversations, accounts and messages, so a caller can attribute
  *   anything a port answers to the channel it came from.
@@ -84,7 +87,7 @@ export interface Inbound {
  * on a channel nothing currently backs rejects, and an `inbound` subscription
  * taken before anything backs it hears the first event once something does.
  */
-export interface Channel {
+export interface Channel extends AppChannel {
   /** The channel's name, as every stored row spells it — `whatsapp`,
    *  `linkedin`, `telegram`. */
   readonly name: string;
@@ -92,8 +95,10 @@ export interface Channel {
   /** Sending on the channel, or null where it cannot send at all. */
   readonly send: ChannelSend | null;
 
-  /** What arrives on the channel, or null where nothing ever arrives. */
-  readonly inbound: Inbound | null;
+  /** What arrives on the channel, or null where nothing ever arrives. The port
+   *  contracts, rules R1–R5 among them, are the apps SDK's: an app hears a
+   *  channel through the same `ChannelInbound` core does. */
+  readonly inbound: ChannelInbound | null;
 
   /**
    * The channel's address book, or null where the platform gives Rome no way
@@ -116,13 +121,18 @@ export interface Channel {
    *
    * A channel that holds the conversation as the platform has it answers back
    * past the point Rome started watching. Whether it reads a table a sync fills
-   * or calls the platform is its own business, and no caller can tell.
+   * or calls the platform is its own business, and no caller of `query` can
+   * tell. Only a copy Rome keeps answers `byAccount`.
    *
    * Null means what was said there survives only in Rome's own transcript — a
    * store that belongs to no channel and answers for all of them. So not every
    * channel has a store, and not every store is a channel's.
    */
   readonly messages: Messages | null;
+
+  /** The conversations the channel can see, or null where it cannot list
+   *  them. */
+  readonly directory: ChannelDirectory | null;
 }
 
 /**
@@ -154,9 +164,12 @@ export function addressBooks(channels: Channels): AddressBooks {
   return books;
 }
 
-/** The channels' own message stores, in the channels' order. Rome's stores —
- *  the agent transcript, the sentinel log — are not here: they belong to no
- *  channel, and a read that wants them appends them behind these. */
-export function messageStores(channels: Channels): Messages[] {
-  return channels.flatMap((channel) => (channel.messages ? [channel.messages] : []));
+/** The channels' own stores that answer per-account reads, in the channels'
+ *  order. Rome's stores — the agent transcript, the sentinel log — are not
+ *  here: they belong to no channel, and a read that wants them appends them
+ *  behind these. */
+export function messageStores(channels: Channels): AccountMessages[] {
+  return channels.flatMap((channel) =>
+    channel.messages?.byAccount ? [channel.messages.byAccount] : [],
+  );
 }

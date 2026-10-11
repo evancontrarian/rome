@@ -6,17 +6,26 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, rs } from "@rstest/core";
 import * as chatApiModule from "@/lib/chat-api" with { rstest: "importActual" };
 import { Chat } from "./Chat";
+import { applyAgentPlacement } from "@/pages/free/use-free-cells";
 import {
+  createSession,
   deleteSession,
   interruptTurn,
   listSessionMessages,
   listSessionTurns,
   openTurnStream,
+  postSessionTurn,
 } from "@/lib/chat-api";
 
 const t = (key: string) => key;
 const mockUseSessionIdentity = rs.hoisted(() => rs.fn());
 const appsPanel = rs.hoisted(() => ({ collapsed: true, setCollapsed: rs.fn() }));
+const mockFindActiveSubmission = rs.hoisted(() => rs.fn(() => null));
+const mockUseChatTabStatus = rs.hoisted(() => rs.fn());
+
+rs.mock("@/hooks/use-tab-status", () => ({
+  useChatTabStatus: mockUseChatTabStatus,
+}));
 
 rs.mock("react-i18next", () => ({
   useTranslation: () => ({ t }),
@@ -36,7 +45,7 @@ rs.mock("@/pages/free/workspace-event-bus", () => ({
 }));
 
 rs.mock("@/pages/free/use-free-cells", () => ({
-  autoPlaceApp: rs.fn(),
+  applyAgentPlacement: rs.fn(),
   useFreeCells: () => ({
     addWidget: rs.fn(),
     placements: [],
@@ -83,10 +92,25 @@ rs.mock("@/pages/free/WidgetPicker", () => ({
 }));
 
 rs.mock("@/components/chat/MessageList", () => ({
-  MessageList: ({ live }: { live: { identity: { name: string } } }) => (
-    <div data-testid="message-list">{live.identity.name}</div>
+  MessageList: ({
+    live,
+    rows,
+  }: {
+    live: { identity: { name: string } };
+    rows: { kind: string; key: string; message?: { content: string } }[];
+  }) => (
+    <>
+      <div data-testid="message-list">{live.identity.name}</div>
+      {rows
+        .filter((row) => row.kind === "user")
+        .map((row) => (
+          <div key={row.key} data-testid="user-row" data-row-key={row.key}>
+            {row.message?.content}
+          </div>
+        ))}
+    </>
   ),
-  findActiveSubmission: () => null,
+  findActiveSubmission: mockFindActiveSubmission,
   findLastSubmission: () => null,
   hasPendingApprovalConfirmation: () => false,
 }));
@@ -94,23 +118,68 @@ rs.mock("@/components/chat/MessageList", () => ({
 rs.mock("@/components/chat/ChatComposer", () => ({
   // Expose the streaming state + Stop wiring so tests can drive stopMessage
   // the way the real composer's Stop button does.
-  ChatComposer: (props: { isStreaming?: boolean; onStop?: () => void }) => (
+  ChatComposer: (props: {
+    isStreaming?: boolean;
+    onStop?: () => void;
+    onSend?: (snapshot: unknown, controls: unknown) => Promise<void>;
+    streamError?: string | { message: string } | null;
+  }) => (
     <div data-testid="chat-composer" data-streaming={props.isStreaming ? "true" : "false"}>
+      {props.streamError ? (
+        <div data-testid="stream-error">
+          {typeof props.streamError === "string" ? props.streamError : props.streamError.message}
+        </div>
+      ) : null}
       {props.isStreaming && props.onStop ? (
         <button type="button" data-testid="stop-button" onClick={props.onStop} />
+      ) : null}
+      {props.onSend ? (
+        <button
+          type="button"
+          data-testid="send-button"
+          onClick={() =>
+            void props
+              .onSend?.(
+                { text: "hi", uploads: [], reasoningEffort: "medium", projectPath: "" },
+                { onUploadProgress: () => {}, signal: new AbortController().signal },
+              )
+              .catch(() => {})
+          }
+        />
+      ) : null}
+      {props.onSend ? (
+        <button
+          type="button"
+          data-testid="send-text-button"
+          onClick={() =>
+            void props
+              .onSend?.(
+                {
+                  text: "sent at once",
+                  uploads: [],
+                  reasoningEffort: "medium",
+                  projectPath: "",
+                  inputId: "11111111-1111-4111-8111-111111111111",
+                },
+                { onUploadProgress: () => {}, signal: new AbortController().signal },
+              )
+              .catch(() => {})
+          }
+        />
       ) : null}
     </div>
   ),
 }));
 
-rs.mock("@/components/chat/blocks", () => ({
-  renderFlatBlocks: () => null,
-  renderSingleBlock: () => null,
+rs.mock("@/components/chat/entries", () => ({
+  renderFlatEntries: () => null,
+  renderSingleEntry: () => null,
 }));
 
 rs.mock("@/lib/chat-api", () => {
   return {
     ...chatApiModule,
+    createSession: rs.fn(),
     deleteSession: rs.fn(),
     interruptTurn: rs.fn(),
     listSessionMessages: rs.fn().mockResolvedValue([]),
@@ -195,6 +264,68 @@ afterEach(() => {
   rs.clearAllMocks();
   rs.unstubAllGlobals();
   MockEventSource.instances = [];
+});
+
+describe("Chat missing-session detection", () => {
+  it("reports a confirmed missing session", async () => {
+    rs.mocked(listSessionMessages).mockResolvedValueOnce(null);
+    const onSessionNotFound = rs.fn();
+    renderChat(<Chat sessionId="missing" onSessionNotFound={onSessionNotFound} />);
+
+    await waitFor(() => expect(onSessionNotFound).toHaveBeenCalledWith("missing"));
+  });
+
+  it("does not report a temporary fetch failure as a missing session", async () => {
+    rs.mocked(listSessionMessages).mockRejectedValueOnce(new Error("Service unavailable"));
+    const onSessionNotFound = rs.fn();
+    await act(async () => {
+      renderChat(<Chat sessionId="session-1" onSessionNotFound={onSessionNotFound} />);
+    });
+
+    expect(listSessionMessages).toHaveBeenCalledWith("session-1");
+    expect(onSessionNotFound).not.toHaveBeenCalled();
+  });
+
+  it("ignores a late missing-session response after leaving the chat", async () => {
+    let resolveMessages!: (value: null) => void;
+    rs.mocked(listSessionMessages).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveMessages = resolve;
+        }),
+    );
+    const onSessionNotFound = rs.fn();
+    const { unmount } = renderChat(
+      <Chat sessionId="missing" onSessionNotFound={onSessionNotFound} />,
+    );
+    unmount();
+
+    await act(async () => resolveMessages(null));
+
+    expect(onSessionNotFound).not.toHaveBeenCalled();
+  });
+});
+
+describe("Chat read marking", () => {
+  it("leaves a chat unread while its tab is hidden, then marks it on return", async () => {
+    const { markSessionRead } = await import("@/lib/chat-api");
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    try {
+      renderChat(<Chat sessionId="session-1" />);
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      expect(markSessionRead).not.toHaveBeenCalled();
+
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+      act(() => {
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      await waitFor(() => expect(markSessionRead).toHaveBeenCalledWith("session-1"));
+    } finally {
+      delete (document as { visibilityState?: unknown }).visibilityState;
+    }
+  });
 });
 
 describe("Chat agent identity", () => {
@@ -370,6 +501,458 @@ describe("Chat turn stream lifecycle", () => {
     expect(signal?.aborted).toBe(true);
   });
 
+  // Regression: a dropped turn SSE (mobile background, network swap) is not a
+  // turn outcome. The chat must stay live and reopen the same turn's stream
+  // instead of flashing Send until the next reattach poll.
+  describe("when the turn stream drops mid-turn", () => {
+    const encoder = new TextEncoder();
+    const doneStream = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('event: done\ndata: {"success":true}\n\n'));
+            controller.close();
+          },
+        }),
+      );
+    const droppingStreams: ReadableStreamDefaultController<Uint8Array>[] = [];
+    const droppingStream = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            droppingStreams.push(controller);
+          },
+        }),
+      );
+
+    const defaultOpenTurnStream = rs.mocked(openTurnStream).getMockImplementation();
+    beforeEach(() => {
+      droppingStreams.length = 0;
+      rs.mocked(listSessionTurns)
+        .mockResolvedValueOnce([{ turnId: "turn-1", status: "running" }])
+        .mockResolvedValue([]);
+    });
+    afterEach(() => {
+      rs.mocked(listSessionTurns).mockResolvedValue([{ turnId: "turn-1", status: "running" }]);
+      rs.mocked(openTurnStream).mockReset().mockImplementation(defaultOpenTurnStream!);
+    });
+
+    it.each([
+      ["replays done", () => Promise.resolve(doneStream())],
+      ["404s", () => Promise.resolve(new Response(null, { status: 404 }))],
+    ])("stays live, then settles once the resumed stream %s", async (_label, resume) => {
+      rs.mocked(openTurnStream)
+        .mockImplementationOnce(() => Promise.resolve(droppingStream()))
+        .mockImplementationOnce(resume);
+      renderChat(<Chat sessionId="session-1" />);
+      const composer = () => screen.getByTestId("chat-composer").getAttribute("data-streaming");
+
+      await waitFor(() => expect(composer()).toBe("true"));
+      const reloadsBeforeDrop = rs.mocked(listSessionMessages).mock.calls.length;
+      await act(async () => {
+        droppingStreams[0]!.error(new TypeError("network connection was lost"));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      // Still live: the drop alone neither ends the turn nor reloads.
+      expect(composer()).toBe("true");
+      expect(rs.mocked(listSessionMessages).mock.calls.length).toBe(reloadsBeforeDrop);
+
+      await waitFor(() => expect(composer()).toBe("false"), { timeout: 3_000 });
+      expect(rs.mocked(openTurnStream).mock.calls.map(([turnId]) => turnId)).toEqual([
+        "turn-1",
+        "turn-1",
+      ]);
+      expect(rs.mocked(listSessionMessages).mock.calls.length).toBeGreaterThan(reloadsBeforeDrop);
+    });
+
+    it("passes each widget placement's id through, so the layout can skip a replay", async () => {
+      const placement = (data: Record<string, unknown>) =>
+        `event: widget_placement\ndata: ${JSON.stringify(data)}\n\n`;
+      rs.mocked(openTurnStream)
+        .mockImplementationOnce(() =>
+          Promise.resolve(
+            new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  droppingStreams.push(controller);
+                  controller.enqueue(
+                    encoder.encode(
+                      placement({ placementId: "place-live", appId: "notes", route: "list" }),
+                    ),
+                  );
+                },
+              }),
+            ),
+          ),
+        )
+        .mockImplementationOnce(() =>
+          Promise.resolve(
+            new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(
+                    encoder.encode(
+                      // The replay of the placement already mounted, then a
+                      // fresh placement of the same route, then one from a
+                      // server that sends no id.
+                      placement({ placementId: "place-live", appId: "notes", route: "list" }) +
+                        placement({ placementId: "place-again", appId: "notes", route: "list" }) +
+                        placement({ appId: "notes", route: "legacy" }) +
+                        'event: done\ndata: {"success":true}\n\n',
+                    ),
+                  );
+                  controller.close();
+                },
+              }),
+            ),
+          ),
+        );
+      renderChat(<Chat sessionId="session-1" />);
+      await waitFor(() => expect(applyAgentPlacement).toHaveBeenCalledTimes(1));
+
+      await act(async () => {
+        droppingStreams[0]!.error(new TypeError("network connection was lost"));
+      });
+      await waitFor(() => expect(openTurnStream).toHaveBeenCalledTimes(2), { timeout: 3_000 });
+      await waitFor(() =>
+        expect(screen.getByTestId("chat-composer").getAttribute("data-streaming")).toBe("false"),
+      );
+      expect(rs.mocked(applyAgentPlacement).mock.calls).toEqual([
+        ["place-live", "notes", "list", undefined],
+        ["place-live", "notes", "list", undefined],
+        ["place-again", "notes", "list", undefined],
+        [undefined, "notes", "legacy", undefined],
+      ]);
+    });
+  });
+
+  it("does not start a second follower when a send lands during a reattach lookup", async () => {
+    let resolveLookup!: (turns: { turnId: string; status: "running" }[]) => void;
+    rs.mocked(listSessionTurns)
+      .mockImplementationOnce(() => new Promise((resolve) => (resolveLookup = resolve)))
+      .mockResolvedValue([]);
+    rs.mocked(postSessionTurn).mockResolvedValue({ ok: true, data: { turnId: "turn-1" } });
+    try {
+      renderChat(<Chat sessionId="session-1" />);
+      await waitFor(() => expect(listSessionTurns).toHaveBeenCalledTimes(1));
+
+      fireEvent.click(screen.getByTestId("send-button"));
+      await waitFor(() => expect(openTurnStream).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        resolveLookup([{ turnId: "turn-1", status: "running" }]);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+
+      expect(openTurnStream).toHaveBeenCalledTimes(1);
+      expect(rs.mocked(openTurnStream).mock.calls[0]?.[1]?.aborted).toBe(false);
+    } finally {
+      rs.mocked(listSessionTurns).mockResolvedValue([{ turnId: "turn-1", status: "running" }]);
+    }
+  });
+
+  it("shows a text-only send before the server accepts it, under the same id", async () => {
+    let resolvePost!: (result: Awaited<ReturnType<typeof postSessionTurn>>) => void;
+    rs.mocked(postSessionTurn).mockImplementationOnce(
+      () => new Promise((resolve) => (resolvePost = resolve)),
+    );
+    renderChat(<Chat sessionId="session-1" />);
+
+    fireEvent.click(screen.getByTestId("send-text-button"));
+    const bubble = await screen.findByTestId("user-row");
+    expect(bubble.dataset.rowKey).toBe("11111111-1111-4111-8111-111111111111");
+    expect(bubble.textContent).toContain("sent at once");
+    expect(postSessionTurn).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolvePost({
+        ok: true,
+        data: {
+          turnId: "turn-1",
+          inputId: "11111111-1111-4111-8111-111111111111",
+          inputState: "submitted",
+        },
+      });
+    });
+
+    expect(screen.getAllByTestId("user-row")).toHaveLength(1);
+    expect(screen.getByTestId("user-row")).toBe(bubble);
+  });
+
+  it("takes the early bubble back down when the send is refused", async () => {
+    let resolvePost!: (result: Awaited<ReturnType<typeof postSessionTurn>>) => void;
+    rs.mocked(postSessionTurn).mockImplementationOnce(
+      () => new Promise((resolve) => (resolvePost = resolve)),
+    );
+    renderChat(<Chat sessionId="session-1" />);
+
+    fireEvent.click(screen.getByTestId("send-text-button"));
+    await screen.findByTestId("user-row");
+
+    await act(async () => {
+      resolvePost({ ok: false, status: 500, message: "boom" });
+    });
+
+    await waitFor(() => expect(screen.queryByTestId("user-row")).toBeNull());
+  });
+
+  it("keeps backing off when resumed streams keep closing right away", async () => {
+    const defaultOpen = rs.mocked(openTurnStream).getMockImplementation();
+    rs.mocked(listSessionTurns)
+      .mockResolvedValueOnce([{ turnId: "turn-1", status: "running" }])
+      .mockResolvedValue([]);
+    // HTTP 200 that ends at EOF without a terminal event, every time.
+    rs.mocked(openTurnStream).mockImplementation(() =>
+      Promise.resolve(new Response(new ReadableStream({ start: (c) => c.close() }))),
+    );
+    try {
+      renderChat(<Chat sessionId="session-1" />);
+      await waitFor(() => expect(openTurnStream).toHaveBeenCalledTimes(1));
+      // Retries at +1 s and +3 s (1 s, then 2 s), not every second.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 3_500));
+      });
+      expect(openTurnStream).toHaveBeenCalledTimes(3);
+      expect(screen.getByTestId("chat-composer").getAttribute("data-streaming")).toBe("true");
+    } finally {
+      rs.mocked(listSessionTurns).mockResolvedValue([{ turnId: "turn-1", status: "running" }]);
+      rs.mocked(openTurnStream).mockReset().mockImplementation(defaultOpen!);
+    }
+  });
+
+  it.each([
+    ["while the stream hangs", false],
+    ["during the retry backoff after a drop", true],
+  ])("follows a turn sent right after Stop releases a dead stream %s", async (_label, drop) => {
+    const dropping: ReadableStreamDefaultController<Uint8Array>[] = [];
+    const defaultOpen = rs.mocked(openTurnStream).getMockImplementation();
+    if (drop) {
+      rs.mocked(openTurnStream).mockImplementationOnce(() =>
+        Promise.resolve(
+          new Response(new ReadableStream<Uint8Array>({ start: (c) => void dropping.push(c) })),
+        ),
+      );
+    }
+    rs.mocked(listSessionTurns).mockResolvedValue([]);
+    rs.mocked(interruptTurn).mockResolvedValue(new Response(null, { status: 404 }));
+    rs.mocked(postSessionTurn)
+      .mockResolvedValueOnce({ ok: true, data: { turnId: "turn-1" } })
+      .mockResolvedValueOnce({ ok: true, data: { turnId: "turn-2" } });
+    try {
+      renderChat(<Chat sessionId="session-1" />);
+      const composer = () => screen.getByTestId("chat-composer").getAttribute("data-streaming");
+
+      fireEvent.click(screen.getByTestId("send-button"));
+      await waitFor(() => expect(composer()).toBe("true"));
+      if (drop) {
+        await act(async () => {
+          dropping[0]!.error(new TypeError("network connection was lost"));
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        });
+      }
+      fireEvent.click(screen.getByTestId("stop-button"));
+      await waitFor(() => expect(composer()).toBe("false"));
+
+      fireEvent.click(screen.getByTestId("send-button"));
+      // Well inside the 1 s resume backoff: the new turn gets its own follower.
+      await waitFor(
+        () => expect(openTurnStream).toHaveBeenCalledWith("turn-2", expect.any(Object)),
+        { timeout: 500 },
+      );
+      expect(composer()).toBe("true");
+    } finally {
+      rs.mocked(listSessionTurns).mockResolvedValue([{ turnId: "turn-1", status: "running" }]);
+      rs.mocked(openTurnStream).mockReset().mockImplementation(defaultOpen!);
+    }
+  });
+
+  it("keeps a background turn's replayed trace and widgets from retargeting the host", async () => {
+    rs.stubGlobal("EventSource", MockEventSource as unknown as typeof EventSource);
+    const encoder = new TextEncoder();
+    const dropping: ReadableStreamDefaultController<Uint8Array>[] = [];
+    const defaultOpen = rs.mocked(openTurnStream).getMockImplementation();
+    rs.mocked(listSessionTurns)
+      .mockResolvedValueOnce([{ turnId: "turn-1", status: "running" }])
+      .mockResolvedValue([]);
+    rs.mocked(openTurnStream)
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          new Response(new ReadableStream<Uint8Array>({ start: (c) => void dropping.push(c) })),
+        ),
+      )
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(c) {
+                c.enqueue(
+                  encoder.encode(
+                    'event: segment_upsert\ndata: {"id":"seg-1","kind":"text"}\n\n' +
+                      'event: widget_placement\ndata: {"appId":"notes"}\n\n' +
+                      'event: done\ndata: {"success":true}\n\n',
+                  ),
+                );
+                c.close();
+              },
+            }),
+          ),
+        ),
+      );
+    const onSessionMessage = rs.fn();
+    try {
+      renderChat(<Chat sessionId="session-1" onSessionMessage={onSessionMessage} />);
+      await waitFor(() => expect(openTurnStream).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(MockEventSource.instances.length).toBeGreaterThan(0));
+
+      // The parent hands the floor to a specialist child.
+      act(() => {
+        MockEventSource.instances[0]?.emit("message_insert", {
+          id: "m-handoff",
+          sessionId: "session-1",
+          turnId: "turn-1",
+          role: "assistant",
+          content: JSON.stringify([
+            {
+              type: "handoff",
+              toolUseId: "h1",
+              appId: "workflow-studio",
+              childSessionId: "child-1",
+              payload: { agentLabel: "Planner" },
+            },
+          ]),
+          createdAt: "2026-10-06T00:00:00.000Z",
+        });
+      });
+      await waitFor(() =>
+        expect(onSessionMessage).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: "child-1" }),
+        ),
+      );
+      onSessionMessage.mockClear();
+
+      // The parent's stream drops and its resumed replay carries a segment.
+      await act(async () => {
+        dropping[0]!.error(new TypeError("network connection was lost"));
+      });
+      await waitFor(() => expect(openTurnStream).toHaveBeenCalledTimes(2), { timeout: 3_000 });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      expect(onSessionMessage).not.toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "session-1", segment: expect.anything() }),
+      );
+      expect(applyAgentPlacement).not.toHaveBeenCalled();
+    } finally {
+      rs.mocked(listSessionTurns).mockResolvedValue([{ turnId: "turn-1", status: "running" }]);
+      rs.mocked(openTurnStream).mockReset().mockImplementation(defaultOpen!);
+    }
+  });
+
+  it("keeps a background turn's failure off the floor composer", async () => {
+    rs.stubGlobal("EventSource", MockEventSource as unknown as typeof EventSource);
+    const encoder = new TextEncoder();
+    const dropping: ReadableStreamDefaultController<Uint8Array>[] = [];
+    const defaultOpen = rs.mocked(openTurnStream).getMockImplementation();
+    rs.mocked(listSessionTurns)
+      .mockResolvedValueOnce([{ turnId: "turn-1", status: "running" }])
+      .mockResolvedValue([]);
+    rs.mocked(openTurnStream)
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          new Response(new ReadableStream<Uint8Array>({ start: (c) => void dropping.push(c) })),
+        ),
+      )
+      .mockImplementationOnce(() =>
+        Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(c) {
+                c.enqueue(
+                  encoder.encode('event: done\ndata: {"success":false,"error":"parent boom"}\n\n'),
+                );
+                c.close();
+              },
+            }),
+          ),
+        ),
+      );
+    const onSessionMessage = rs.fn();
+    try {
+      renderChat(<Chat sessionId="session-1" onSessionMessage={onSessionMessage} />);
+      await waitFor(() => expect(openTurnStream).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(MockEventSource.instances.length).toBeGreaterThan(0));
+
+      // The parent hands the floor to a specialist child.
+      act(() => {
+        MockEventSource.instances[0]?.emit("message_insert", {
+          id: "m-handoff",
+          sessionId: "session-1",
+          turnId: "turn-1",
+          role: "assistant",
+          content: JSON.stringify([
+            {
+              type: "handoff",
+              toolUseId: "h1",
+              appId: "workflow-studio",
+              childSessionId: "child-1",
+              payload: { agentLabel: "Planner" },
+            },
+          ]),
+          createdAt: "2026-10-06T00:00:00.000Z",
+        });
+      });
+      await waitFor(() =>
+        expect(onSessionMessage).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: "child-1" }),
+        ),
+      );
+
+      // The parent's stream drops and its resumed replay ends the turn failed.
+      await act(async () => {
+        dropping[0]!.error(new TypeError("network connection was lost"));
+      });
+      await waitFor(() => expect(openTurnStream).toHaveBeenCalledTimes(2), { timeout: 3_000 });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      expect(screen.queryByTestId("stream-error")).toBeNull();
+    } finally {
+      rs.mocked(listSessionTurns).mockResolvedValue([{ turnId: "turn-1", status: "running" }]);
+      rs.mocked(openTurnStream).mockReset().mockImplementation(defaultOpen!);
+    }
+  });
+
+  it.each([
+    ["done", '{"success":false,"error":"floor boom"}'],
+    ["stream_error", '{"error":"floor boom"}'],
+  ])("shows the floor turn's own %s failure on the composer", async (event, data) => {
+    const encoder = new TextEncoder();
+    const defaultOpen = rs.mocked(openTurnStream).getMockImplementation();
+    rs.mocked(listSessionTurns)
+      .mockResolvedValueOnce([{ turnId: "turn-1", status: "running" }])
+      .mockResolvedValue([]);
+    rs.mocked(openTurnStream).mockImplementationOnce(() =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(encoder.encode(`event: ${event}\ndata: ${data}\n\n`));
+              c.close();
+            },
+          }),
+        ),
+      ),
+    );
+    try {
+      renderChat(<Chat sessionId="session-1" />);
+      await waitFor(() =>
+        expect(screen.getByTestId("stream-error").textContent).toBe("floor boom"),
+      );
+    } finally {
+      rs.mocked(listSessionTurns).mockResolvedValue([{ turnId: "turn-1", status: "running" }]);
+      rs.mocked(openTurnStream).mockReset().mockImplementation(defaultOpen!);
+    }
+  });
+
   // Regression: on mobile, a backgrounded/locked page silently kills the turn
   // SSE — the streaming entry then outlives the turn, and tapping Stop hit a
   // finished turn (interrupt → 404) that used to be swallowed with no effect
@@ -486,6 +1069,46 @@ describe("Chat turn stream lifecycle", () => {
   });
 });
 
+describe("Chat tab status", () => {
+  afterEach(() => {
+    mockFindActiveSubmission.mockReturnValue(null);
+    rs.mocked(listSessionMessages).mockResolvedValue([]);
+    rs.mocked(listSessionTurns).mockResolvedValue([{ turnId: "turn-1", status: "running" }]);
+  });
+
+  it("counts a specialist submission waiting on Approve as needing the guardian", async () => {
+    mockFindActiveSubmission.mockReturnValue({ messageId: "sub-1", payload: { plan: "x" } });
+    rs.mocked(listSessionTurns).mockResolvedValue([]);
+    rs.mocked(listSessionMessages).mockImplementation(async (sessionId: string) =>
+      sessionId === "session-1"
+        ? [
+            {
+              id: "m-handoff",
+              sessionId: "session-1",
+              turnId: "turn-1",
+              role: "assistant",
+              content: JSON.stringify([
+                {
+                  type: "handoff",
+                  toolUseId: "h1",
+                  appId: "workflow-studio",
+                  childSessionId: "child-1",
+                  payload: { agentLabel: "Planner" },
+                },
+              ]),
+              createdAt: "2026-10-05T00:00:00.000Z",
+            },
+          ]
+        : [],
+    );
+    renderChat(<Chat sessionId="session-1" />);
+
+    await waitFor(() =>
+      expect(mockUseChatTabStatus).toHaveBeenLastCalledWith(false, true, false, expect.any(Number)),
+    );
+  });
+});
+
 describe("Chat jump to latest", () => {
   it("hides the control while the viewport is already at the tail", () => {
     renderChat(<Chat sessionId="session-1" />);
@@ -508,5 +1131,39 @@ describe("Chat jump to latest", () => {
     // the hook's user-gesture window while still short of the bottom, and is read
     // as the user scrolling away — releasing the pin this click just re-engaged.
     expect(stickToBottom.scrollToBottom).toHaveBeenCalledWith("auto");
+  });
+});
+
+describe("Chat draft", () => {
+  it("creates its session on the first send and follows that turn without a reattach", async () => {
+    rs.mocked(createSession).mockResolvedValueOnce({ id: "created-1" } as Awaited<
+      ReturnType<typeof createSession>
+    >);
+    rs.mocked(postSessionTurn).mockResolvedValueOnce({ ok: true, data: { turnId: "turn-1" } });
+    const onSessionCreated = rs.fn();
+    renderChat(<Chat emptyState={<p>Empty home</p>} onSessionCreated={onSessionCreated} />);
+    expect(screen.getByText("Empty home")).toBeTruthy();
+    expect(screen.queryByTestId("message-list")).toBeNull();
+    expect(screen.queryByRole("button", { name: "navbar.more" })).toBeNull();
+    const composer = screen.getByTestId("chat-composer");
+
+    fireEvent.click(screen.getByTestId("send-button"));
+
+    await waitFor(() => expect(openTurnStream).toHaveBeenCalledTimes(1));
+    expect(onSessionCreated).toHaveBeenCalledWith("created-1");
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "sidebar.newChat", reasoningEffort: "medium" }),
+    );
+    expect(postSessionTurn).toHaveBeenCalledWith(
+      "created-1",
+      expect.any(FormData),
+      expect.anything(),
+    );
+    expect(screen.queryByText("Empty home")).toBeNull();
+    expect(screen.getByTestId("message-list")).toBeTruthy();
+    expect(screen.getByTestId("chat-composer")).toBe(composer);
+    // The send registered its local follow before the render that adopted the
+    // session, so the reattach poll never looks the turn up.
+    expect(listSessionTurns).not.toHaveBeenCalled();
   });
 });

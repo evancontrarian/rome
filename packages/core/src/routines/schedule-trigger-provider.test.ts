@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, rs } from "@rstest/core";
 import type { Cron } from "croner";
-import { ScheduleTriggerProvider } from "./schedule-trigger-provider.js";
+import { nextDateForLocalTime, ScheduleTriggerProvider } from "./schedule-trigger-provider.js";
 import { createTestDb, type TestDb } from "../test/helpers.js";
 import { RoutinesRepository } from "../db/repositories/routines.js";
 import type { SessionActor } from "../lib/session-actor.js";
@@ -76,37 +76,12 @@ describe("ScheduleTriggerProvider", () => {
     expect(after!.nextRunAt!.getTime()).toBeGreaterThan(Date.now());
   });
 
-  it("one-off (no rrule): firing marks the routine consumed and drops the cron job", async () => {
-    const id = await repo.create({
-      name: "one-off",
+  it("refuses a schedule with neither date nor rrule", async () => {
+    const routine = buildRoutine({
       trigger: { type: "schedule", tzid: "UTC", tzMode: "fixed", localTime: "12:00" },
-      actionName: "noop",
-      args: {},
-      enabled: true,
     });
-    const row = await repo.findById(id);
-    const routine = buildRoutine({ id, trigger: row!.trigger as Trigger });
-
-    const firedPayloads: Record<string, unknown>[] = [];
-    await provider.activate(routine, async (p) => {
-      firedPayloads.push(p);
-    });
-    expect(provider.isActive(id)).toBe(true);
-
-    await jobFor(provider, id).trigger();
-
-    // The fire callback ran exactly once with a scheduledTime payload
-    expect(firedPayloads).toHaveLength(1);
-    expect(typeof firedPayloads[0].scheduledTime).toBe("string");
-
-    // The routine is now consumed: enabled=false, nextRunAt cleared
-    const after = await repo.findById(id);
-    expect(after?.enabled).toBe(false);
-    expect(after?.nextRunAt).toBeNull();
-
-    // The provider no longer considers this routine active — a process
-    // restart won't re-schedule it.
-    expect(provider.isActive(id)).toBe(false);
+    await provider.activate(routine, async () => {});
+    expect(provider.isActive(routine.id)).toBe(false);
   });
 
   it("recurring: firing updates nextRunAt to a strictly later scheduled time", async () => {
@@ -161,9 +136,7 @@ describe("ScheduleTriggerProvider", () => {
   });
 
   it("dated one-off: fires at the specified date+time, consumes, drops job", async () => {
-    // True one-off pinned to a specific calendar date — distinct from the
-    // legacy "next HH:mm" path. activate() schedules a single Cron(Date,...)
-    // fire; manual trigger() invokes the callback, which records the fire
+    // activate() schedules a single Cron(Date,...) fire; manual trigger() invokes the callback, which records the fire
     // and marks the routine consumed.
     rs.useFakeTimers({ shouldAdvanceTime: false });
     try {
@@ -266,36 +239,6 @@ describe("ScheduleTriggerProvider", () => {
     }
   });
 
-  it("legacy row with no tzMode defaults to floating, never to the literal tzid", async () => {
-    // tzMode is required now and existing rows were backfilled, but the read
-    // path must still fail safe: a row that somehow lacks tzMode follows the
-    // guardian, never its stored snapshot. Cast past the type to
-    // simulate such a row.
-    const floatingProvider = new ScheduleTriggerProvider(repo, async () => "America/New_York");
-    const id = await repo.create({
-      name: "legacy",
-      trigger: {
-        type: "schedule",
-        tzid: "Asia/Tokyo",
-        localTime: "09:00",
-        rrule: "FREQ=DAILY",
-      } as unknown as Trigger,
-      actionName: "noop",
-      args: {},
-      enabled: true,
-    });
-    const row = await repo.findById(id);
-    const routine = buildRoutine({ id, trigger: row!.trigger as Trigger });
-
-    await floatingProvider.activate(routine, async () => {});
-    try {
-      const job = jobFor(floatingProvider, id) as unknown as { options: { timezone?: string } };
-      expect(job.options.timezone).toBe("America/New_York");
-    } finally {
-      floatingProvider.stop();
-    }
-  });
-
   it("deactivate stops the cron job AND drops it from the active set", async () => {
     const id = await repo.create({
       name: "stop-me",
@@ -330,7 +273,7 @@ describe("ScheduleTriggerProvider", () => {
   // request's session-actor scope or every autonomous fire is attributed to
   // that session. A mocked Cron captures the ambient actor at construction —
   // the moment the real croner registers its timer.
-  it("constructs cron jobs outside the ambient session-actor scope (all three branches)", async () => {
+  it("constructs cron jobs outside the ambient session-actor scope (both branches)", async () => {
     // rs.resetModules gives the re-imported provider a FRESH session-actor
     // module (fresh ALS instance), so the scope must be entered and observed
     // through that same fresh module — not this file's top-level import.
@@ -359,9 +302,8 @@ describe("ScheduleTriggerProvider", () => {
       const mocked = new MockedProvider(repo);
       const actor: SessionActor = { kind: "guardian", userId: "seat-1", via: "cookie" };
       const triggers: Trigger[] = [
-        // dated one-off, legacy one-off, recurring — one per Cron construction
+        // dated one-off, recurring — one per Cron construction
         { type: "schedule", tzid: "UTC", tzMode: "fixed", localTime: "09:00", date: "2099-01-02" },
-        { type: "schedule", tzid: "UTC", tzMode: "fixed", localTime: "12:00" },
         { type: "schedule", tzid: "UTC", tzMode: "fixed", localTime: "09:00", rrule: "FREQ=DAILY" },
       ];
 
@@ -372,7 +314,7 @@ describe("ScheduleTriggerProvider", () => {
         }
       });
 
-      expect(capturedAtConstruction).toHaveLength(3);
+      expect(capturedAtConstruction).toHaveLength(2);
       for (const captured of capturedAtConstruction) {
         expect(await captured).toBeUndefined();
       }
@@ -381,5 +323,13 @@ describe("ScheduleTriggerProvider", () => {
       rs.doUnmock("croner");
       rs.resetModules();
     }
+  });
+});
+
+describe("nextDateForLocalTime", () => {
+  it("rolls to tomorrow when today's time is only seconds away", () => {
+    const now = new Date("2026-06-23T08:59:58Z");
+    expect(nextDateForLocalTime("09:00", "UTC", now)).toBe("2026-06-24");
+    expect(nextDateForLocalTime("09:01", "UTC", now)).toBe("2026-06-23");
   });
 });

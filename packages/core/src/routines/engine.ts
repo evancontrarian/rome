@@ -4,10 +4,12 @@ import type { Routine, RoutineRunStatus } from "./types.js";
 import type { RoutinesRepository } from "../db/repositories/routines.js";
 import { toRoutine } from "../db/repositories/routines.js";
 import type { RoutineRunsRepository } from "../db/repositories/routine-runs.js";
-import type { ActionEngine } from "../actions/engine.js";
+import type { ActionEngine, ActionRunContext } from "../actions/engine.js";
 import { createLogger } from "../logger.js";
 import { withRomeSpan } from "../telemetry.js";
 import { runWithoutHookInvocationContext } from "../core/hook-recursion.js";
+import { actionExecutionContext } from "../actions/context.js";
+import { replayContext } from "../actions/replay.js";
 import type { Clock, ClockTimer } from "../lib/clock.js";
 
 const log = createLogger("routine-engine");
@@ -162,10 +164,24 @@ export class RoutineEngine {
     return { stopped: true, killedLiveProcess };
   }
 
-  private async dispatch(
+  /** A routine fire is its own root. Event-bus subscribers run in the
+   * publisher's async context; without exiting it, the run (and any retry timer
+   * it schedules) would nest under the publishing action and inherit its
+   * agentName. */
+  private dispatch(
     routine: Routine,
     payload: Record<string, unknown>,
     opts: { manual?: boolean } = {},
+  ): Promise<{ runId: string; status: RoutineRunStatus; error?: string }> {
+    return replayContext.exit(() =>
+      actionExecutionContext.exit(() => this.dispatchAsRoot(routine, payload, opts)),
+    );
+  }
+
+  private async dispatchAsRoot(
+    routine: Routine,
+    payload: Record<string, unknown>,
+    opts: { manual?: boolean },
   ): Promise<{ runId: string; status: RoutineRunStatus; error?: string }> {
     const startTime = this.clock.now().getTime();
 
@@ -179,6 +195,7 @@ export class RoutineEngine {
       executionId: rootExecutionId,
       status: "running",
       payload,
+      firedBy: opts.manual ? "run_now" : routine.trigger.type,
     });
 
     // Captured inside the span callback and returned to the caller so a manual
@@ -202,9 +219,11 @@ export class RoutineEngine {
         });
 
         const mergedArgs = { ...routine.args, __triggerPayload: payload };
-        const context = {
+        // A routine fire holds no action worker, so it can wait out a busy pool.
+        const context: ActionRunContext = {
           initiator: `routine:${routine.name}`,
           rootExecutionId,
+          whenWorkersBusy: "queue",
         };
 
         try {
@@ -301,6 +320,7 @@ export class RoutineEngine {
                       await runWithoutHookInvocationContext(() =>
                         this.actionEngine.run(routine.actionName, mergedArgs, {
                           initiator: `routine:${routine.name}`,
+                          whenWorkersBusy: "queue",
                         }),
                       );
                       log.info("routine retry succeeded", {

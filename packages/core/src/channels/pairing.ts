@@ -1,10 +1,13 @@
-import type { ConversationId, InboundMessage, TalkRouter } from "@rome-os/app-runtime";
+import type { ChannelMessage, ConversationId } from "@rome-os/app-runtime";
+import type { ConnectionRegistry } from "../connections/registry.js";
 import { pairingPayload, pairingPayloadSchema } from "@rome/api-types/approvals";
 import type { ApprovalsRepository } from "../db/repositories/approvals.js";
 import type { PersonMappingRepository } from "../db/repositories/person-mapping.js";
 import { createLogger } from "../logger.js";
+import type { Admission } from "./admission.js";
 import { STRANGER_PERSON_ID } from "../constants.js";
 import { isPairingCodeMessage } from "./pairing-code.js";
+import { sendThrough } from "./connection-ports.js";
 
 const log = createLogger("channel-pairing");
 function pairingAccount(
@@ -45,17 +48,27 @@ export function createPairingAdmission(deps: {
   approvalsRepo: ApprovalsRepository;
   personMappingRepo: PersonMappingRepository;
   talkGrants: (service: string) => readonly string[];
-}) {
-  return async (
-    connectionId: string,
-    service: string,
-    message: InboundMessage,
-    router: TalkRouter,
-  ): Promise<boolean> => {
+  /** The Connections pairing replies go out on. */
+  registry: Pick<ConnectionRegistry, "get">;
+}): Admission {
+  return async (connectionId, service, message) => {
     const channel = pairingPayloadSchema.shape.channel.safeParse(service);
     if (!channel.success) return true;
     const pairingChannel = channel.data;
     if (service === "telegram" && !/^[1-9][0-9]*$/.test(message.senderId)) return false;
+    // Replies go out in the background: the decision never depends on them,
+    // and admission takes a conversation's messages one at a time, so a send
+    // that hangs must not hold up the next message.
+    // Accepted trade-off: the "paired" confirmation is not ordered against the
+    // conversation's next reply, so on a slow provider it can arrive after the
+    // agent's first answer. Approval is recorded before the send, so only the
+    // order of the two bot messages is at stake.
+    const reply = (text: string): void => {
+      sendOn(deps.registry, connectionId, message.conversationId, text).catch(() => {
+        // Provider errors may include the rejected request body. Do not log them.
+        log.error("pairing reply failed", { connectionId, senderId: message.senderId });
+      });
+    };
     const guidance = `🔗 Pair ${pairingAccount(service, message.senderId, message.senderDisplayName, message.senderUsername)} with Rome.\n\nOpen \`Settings\` → \`Connections\` in the Rome Web UI.\n\nLearn more in the [Pairing Guide](https://romeos.cc/docs/rome/${service === "feishu" ? "lark" : service}).`;
     try {
       if (isPairingCodeMessage(message.text)) {
@@ -70,8 +83,7 @@ export function createPairingAdmission(deps: {
             },
             deps.talkGrants(service),
           );
-          if (request?.guide)
-            await router.send(connectionId, message.conversationId, { text: guidance });
+          if (request?.guide) reply(guidance);
           return false;
         }
         const result = deps.approvalsRepo.verifyPairing({
@@ -86,19 +98,19 @@ export function createPairingAdmission(deps: {
           outcome: result.outcome,
         });
         if (result.outcome === "resolved" && result.approval.status === "approved") {
-          await router.send(connectionId, message.conversationId, {
-            text: pairingSuccess(
+          reply(
+            pairingSuccess(
               service,
               message.senderId,
               message.senderDisplayName,
               message.senderUsername,
             ),
-          });
+          );
         }
         if (result.outcome === "invalid_code" && "notify" in result && result.notify) {
-          await router.send(connectionId, message.conversationId, {
-            text: "The code was not accepted. Check the pending request in Settings → Connections or Activity. After five failed attempts, ask the guardian to approve it there.",
-          });
+          reply(
+            "The code was not accepted. Check the pending request in Settings → Connections or Activity. After five failed attempts, ask the guardian to approve it there.",
+          );
         }
         return false;
       }
@@ -121,7 +133,7 @@ export function createPairingAdmission(deps: {
         deps.talkGrants(service),
       );
       if (request?.guide) {
-        await router.send(connectionId, message.conversationId, { text: guidance });
+        reply(guidance);
         log.info("pairing guidance sent", { approvalId: request.approval.id, connectionId });
       }
       return false;
@@ -133,31 +145,57 @@ export function createPairingAdmission(deps: {
   };
 }
 
+/** A resolved approval, as {@link notifyPairingResolution} reads it. */
+export interface ResolvedApproval {
+  id: string;
+  type: string;
+  status: string;
+  payload: unknown;
+}
+
+/** {@link notifyPairingResolution} bound to the registry, for callers that
+ *  hold no Connection. */
+export type PairingNotifier = (approval: ResolvedApproval) => Promise<void>;
+
+/**
+ * Tells the account behind an approved pairing request that it can start
+ * chatting. Pairing belongs to the Connection the request arrived through, as
+ * admission does, so the notice goes out on that Connection rather than on
+ * whichever one backs the channel first.
+ */
 export async function notifyPairingResolution(
-  router: TalkRouter,
-  approval: { id: string; type: string; status: string; payload: unknown },
+  registry: Pick<ConnectionRegistry, "get">,
+  approval: ResolvedApproval,
 ) {
   const payload = pairingPayload(approval);
   if (!payload || approval.status !== "approved") return;
   try {
     const conversationId =
       (payload.conversationId as ConversationId | undefined) ??
-      (await router
-        .feature(payload.connectionId, "directMessaging")
-        ?.conversationFor(payload.channelUserId));
+      (await registry
+        .get(payload.connectionId)
+        .withTalker((talker) => talker.directMessaging?.conversationFor(payload.channelUserId)));
     if (!conversationId) throw new Error("Direct conversation unavailable");
-    await router.send(payload.connectionId, conversationId, {
-      text: pairingSuccess(
-        payload.channel,
-        payload.channelUserId,
-        payload.displayName,
-        payload.username,
-      ),
-    });
+    await sendOn(
+      registry,
+      payload.connectionId,
+      conversationId,
+      pairingSuccess(payload.channel, payload.channelUserId, payload.displayName, payload.username),
+    );
   } catch {
     log.warn("pairing notification failed", {
       approvalId: approval.id,
       connectionId: payload.connectionId,
     });
   }
+}
+
+/** Sends `text` on one Connection, which must be able to talk now. */
+async function sendOn(
+  registry: Pick<ConnectionRegistry, "get">,
+  connectionId: string,
+  conversationId: ConversationId,
+  text: string,
+): Promise<void> {
+  await sendThrough(registry.get(connectionId), conversationId, { text });
 }

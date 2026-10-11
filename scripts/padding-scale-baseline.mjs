@@ -41,15 +41,9 @@ export const BASELINE = {
     "padding: 1rem",
     "padding: clamp(1rem, 2vw, 1.75rem)",
   ],
-  "rome_apps/dream/src/web/App.tsx": ['padding: "24px"', 'padding: "32px"'],
   "rome_apps/inbox/src/web/App.tsx": ['padding: "24px"', 'padding: "32px"'],
   "rome_apps/recap/src/web/App.tsx": ["p-[18px]"],
   "rome_apps/system/src/web/App.tsx": ['padding: "24px"', 'padding: "32px"'],
-  "rome_apps/workflow-studio/src/web/styles.css": [
-    "padding: 10px 12px",
-    "padding: 8px 12px",
-    "padding: 8px 14px",
-  ],
 };
 
 export const baselineKeys = new Set(

@@ -1,11 +1,13 @@
 // WeChat user-account (personal) transport. Channel contract: docs/architecture/channels.md.
 
 import { execFile } from "node:child_process";
-import { access, mkdir, readFile, rm, symlink } from "node:fs/promises";
+import { access, mkdir, open, readdir, readFile, rm, symlink } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
+import { zstdDecompressSync } from "node:zlib";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { DESKTOP_SCRIPT, type DesktopSlot, desktopSlot, startDesktopArgs } from "../desktops.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("wechat-user");
@@ -22,13 +24,14 @@ export const WECHAT_CLIENT_SHA256 =
 
 /**
  * The reader's understanding of WeChat's on-disk formats — SQLCipher page
- * layout, zstd message bodies, the sharded message tables — comes from
- * `wechat-cli`, pinned to a commit. The helper next to this file calls into it
- * rather than shelling out to its command line, which renders every message as
- * a display string and loses the fields a caller wants.
+ * layout, zstd message bodies, the sharded message tables — comes from the
+ * `wechat-bridge` package, pinned in packages/core. Rome runs its `wechat-cli`
+ * command with `-f json`, which answers one envelope per call.
  */
-export const WECHAT_CLI_SOURCE =
-  "git+https://github.com/huohuoer/wechat-cli@a3789232d4f79bf0b30634d9dadbce71e4acd601";
+function bridgeEntry(): string {
+  const require = createRequire(import.meta.url);
+  return join(dirname(require.resolve("wechat-bridge/package.json")), "dist", "index.js");
+}
 
 /** Where the deb is unpacked to, and the path the client insists on being at. */
 export const WECHAT_CANONICAL_PREFIX = "/opt/wechat";
@@ -75,6 +78,18 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 /** Installing downloads and unpacks the better part of a gigabyte. */
 const INSTALL_TIMEOUT_MS = 20 * 60_000;
+/** How long the start script waits for another run of the same desktop. */
+const DESKTOP_LOCK_WAIT_S = 20;
+/** The start script's worst case: the lock wait, then up to 30 s for each of
+ *  its two ports (wait_for_tcp_port) and 5 s for Openbox, in
+ *  scripts/docker/rome-start-desktop.sh. Change those waits there and here
+ *  together. The timeout leaves a margin past that, so a busy lock fails with
+ *  the script's own message, not a kill. */
+const DESKTOP_START_TIMEOUT_MS = (DESKTOP_LOCK_WAIT_S + 30 + 30 + 5 + 15) * 1000;
+
+function sharedDisplay(): string {
+  return process.env.DISPLAY || ":99";
+}
 
 export interface RunResult {
   code: number | null;
@@ -124,6 +139,16 @@ export const runCommand: RunCommand = (file, args, opts = {}) =>
     );
   });
 
+/** `promise`, or `signal`'s reason as soon as it aborts. The work goes on. */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
 // ── status ────────────────────────────────────────────────────────────────
 
 /**
@@ -158,6 +183,15 @@ export interface WechatUserStatus {
   /** The client's pid in THIS container's namespace. The key-recovery step
    *  is used only inside this container. */
   pid?: number;
+  /** The X display the running client is on, or the one a new client starts on. */
+  display: string;
+  /** The page that shows `display` to the guardian, for sign-in links. */
+  desktopPath: string;
+  /** The running client is still on the shared display, beside Rome's Chrome,
+   *  though WeChat's own desktop can start. It moves there when it next starts:
+   *  quitting it lets the health probe start it again on its own desktop, and
+   *  the phone may ask to confirm the sign-in. */
+  movePending: boolean;
 }
 
 // ── reader shapes ─────────────────────────────────────────────────────────
@@ -195,9 +229,75 @@ export const wechatUserMessageSchema = z.object({
 });
 export type WechatUserMessage = z.infer<typeof wechatUserMessageSchema>;
 
-const conversationsSchema = z.object({ conversations: z.array(wechatUserConversationSchema) });
-const messagesSchema = z.object({ messages: z.array(wechatUserMessageSchema) });
-const countSchema = z.object({ count: z.number().int().nonnegative() });
+// ── bridge shapes ─────────────────────────────────────────────────────────
+// The parts of `wechat-cli -f json`'s output the reader keeps. Its `schema`
+// command prints the whole contract.
+
+const bridgeEnvelopeSchema = z.union([
+  z.object({ ok: z.literal(true), data: z.unknown() }),
+  z.object({
+    ok: z.literal(false),
+    error: z.object({ code: z.string(), message: z.string(), hint: z.string().optional() }),
+  }),
+]);
+
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+
+/**
+ * A session preview as text. The client sometimes stores the preview as a
+ * BLOB, often zstd-compressed, and the bridge passes it through as raw bytes,
+ * which JSON renders as an object of byte values. A missing (null) or
+ * unreadable preview reads as empty rather than failing the whole list.
+ */
+const previewSchema = z
+  .union([z.string(), z.null(), z.record(z.string(), z.number().int().min(0).max(255))])
+  .transform((value) => {
+    if (value === null) return "";
+    if (typeof value === "string") return value;
+    const bytes = Buffer.from(
+      Object.keys(value)
+        .sort((a, b) => Number(a) - Number(b))
+        .map((key) => value[key]!),
+    );
+    try {
+      const plain = bytes.subarray(0, 4).equals(ZSTD_MAGIC)
+        ? zstdDecompressSync(bytes, { maxOutputLength: 1 << 20 })
+        : bytes;
+      return plain.toString("utf8");
+    } catch {
+      return "";
+    }
+  });
+
+const bridgeSessionSchema = z.object({
+  username: z.string().min(1),
+  displayName: z.string(),
+  type: z.enum(["private", "group", "official", "folded"]),
+  unread: z.number().int().nonnegative(),
+  lastMessage: z.object({ content: previewSchema, createdAt: z.string().optional() }).optional(),
+});
+type BridgeSession = z.infer<typeof bridgeSessionSchema>;
+
+const bridgeMessageSchema = z.object({
+  id: z.string().min(1),
+  session: z.string().min(1),
+  sessionType: z.enum(["private", "group", "official", "folded"]),
+  sender: z.string(),
+  senderName: z.string().optional(),
+  groupNickname: z.string().optional(),
+  isSelf: z.boolean(),
+  type: z.string(),
+  content: z.string(),
+  createdAt: z.string(),
+});
+type BridgeMessage = z.infer<typeof bridgeMessageSchema>;
+
+const bridgeCountSchema = z.object({ count: z.number().int().nonnegative() });
+
+const bridgePageSchema = z.object({
+  messages: z.array(bridgeMessageSchema),
+  cursor: z.string().nullable(),
+});
 
 /** The account is not readable: signed out, or a key that no longer fits. Only
  *  a fresh scan fixes it, so the integration maps this to CredentialRejected. */
@@ -206,23 +306,6 @@ export class WechatUserSessionRejected extends Error {
     super(message);
     this.name = "WechatUserSessionRejected";
   }
-}
-
-/**
- * WeChat's own X display (docs/wechat-personal.md): the one rule the runtime,
- * the desktop proxy and startup validation share. Null while WeChat is disabled
- * or WECHAT_USER_DISPLAY is unset; the entrypoint starts no such display then.
- * Like the entrypoint, a value that is not `:<number>`, or that names the shared
- * display, is an error.
- */
-export function wechatUserDisplay(env: NodeJS.ProcessEnv = process.env): string | null {
-  const display = env.WECHAT_USER_DISPLAY;
-  if (env.WECHAT_USER_ENABLED !== "true" || !display) return null;
-  const shared = env.DISPLAY || ":99";
-  if (!/^:\d+$/.test(display) || display === shared) {
-    throw new Error(`WECHAT_USER_DISPLAY must be a display like :100, other than ${shared}`);
-  }
-  return display;
 }
 
 /** The client or its reader could not be run. Transient by assumption. */
@@ -240,7 +323,7 @@ export function isWechatUserSessionRejected(error: unknown): boolean {
   return error instanceof WechatUserSessionRejected;
 }
 
-export function wechatRuntimeDir(): string {
+function wechatRuntimeDir(): string {
   return join("/run/user", String(process.getuid?.() ?? 0));
 }
 
@@ -252,9 +335,16 @@ export interface WechatUserRuntimeConfig {
   prefix?: string;
   /** The container's own home, where the client writes its store. */
   home?: string;
-  /** The X display the client runs on: WeChat's own display (`WECHAT_USER_DISPLAY`)
-   *  when set, else the shared desktop. */
+  /** A fixed X display for the client. It bypasses WeChat's own desktop, and
+   *  tests use it. */
   display?: string;
+  /** WeChat's own desktop. Defaults to the `wechat` row of the desktop table,
+   *  `desktopSlot("wechat")`. Null keeps the client on the shared desktop. */
+  desktop?: DesktopSlot | null;
+  /** The script that starts the desktop. Defaults to the one in the image. */
+  desktopScript?: string;
+  /** Where to read a running client's environment. Defaults to /proc. */
+  procDir?: string;
   /** The path the client is exposed at. Defaults to its canonical /opt/wechat;
    *  injectable so tests need no writable /opt. */
   canonicalPrefix?: string;
@@ -263,11 +353,6 @@ export interface WechatUserRuntimeConfig {
   /** The AT-SPI bus launcher; injectable so tests need no real one. */
   accessibilityLauncher?: string;
   run?: RunCommand;
-}
-
-/** Resolve the helper that ships next to this module. */
-function helperPath(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "wechat-user-helper.py");
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -288,24 +373,32 @@ export function loginWindowId(tree: string): string | null {
 export class WechatUserRuntime {
   readonly prefix: string;
   readonly home: string;
-  readonly display: string;
-  /** The page that shows `display` to the guardian, for sign-in links. */
-  readonly desktopPath: string;
+  private readonly desktop: DesktopSlot | null;
+  private readonly desktopScript: string;
+  private readonly procDir: string;
+  private readonly startDisplay: string;
   readonly canonicalPrefix: string;
   readonly runtimeDir: string;
   readonly accessibilityLauncher: string;
   private readonly run: RunCommand;
   private starting: Promise<void> | null = null;
+  private installing: Promise<void> | null = null;
+  private captures = 0;
+  private keysCheckedAt = 0;
+  private bridgeQueue: Promise<unknown> = Promise.resolve();
 
   constructor(config: WechatUserRuntimeConfig = {}) {
     this.home = config.home ?? process.env.HOME ?? homedir();
     this.prefix = config.prefix ?? join(this.home, ".local", "share", "wechat");
-    // WeChat's own display when one is configured (docs/wechat-personal.md), else
-    // the shared desktop. The client, its login window and the health check all
-    // live on this display.
-    const own = wechatUserDisplay();
-    this.display = config.display ?? (own || process.env.DISPLAY || ":99");
-    this.desktopPath = own && this.display === own ? "/desktop/wechat" : "/desktop";
+    // WeChat runs on its own desktop (docs/architecture/named-desktops.md).
+    this.desktop = config.display
+      ? null
+      : config.desktop !== undefined
+        ? config.desktop
+        : desktopSlot("wechat");
+    this.desktopScript = config.desktopScript ?? DESKTOP_SCRIPT;
+    this.procDir = config.procDir ?? "/proc";
+    this.startDisplay = config.display ?? this.desktop?.display ?? sharedDisplay();
     this.canonicalPrefix = config.canonicalPrefix ?? WECHAT_CANONICAL_PREFIX;
     this.runtimeDir = config.runtimeDir ?? wechatRuntimeDir();
     this.accessibilityLauncher = config.accessibilityLauncher ?? ACCESSIBILITY_LAUNCHER;
@@ -317,13 +410,46 @@ export class WechatUserRuntime {
     return join(this.prefix, "client", "opt", "wechat");
   }
 
-  /** The python environment holding the reader's dependencies. */
-  get venvDir(): string {
-    return join(this.prefix, "cli");
+  /**
+   * Hold off every ordinary launch while the connection's setup prepares and
+   * runs its key capture, which replaces the client with one under a debugger. `start()` launches nothing until the
+   * returned release runs. The capture kills the client on purpose, so nothing,
+   * such as the guardian opening /desktop/wechat, may bring an ordinary one back
+   * while it runs.
+   */
+  holdCapture(): () => void {
+    this.captures += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.captures -= 1;
+    };
+  }
+
+  /** Whether a key capture holds the client. */
+  get captureInProgress(): boolean {
+    return this.captures > 0;
+  }
+
+  /** Whether an install is running for any caller. */
+  get installInFlight(): boolean {
+    return this.installing !== null;
+  }
+
+  /** Whether the client is unpacked in this container. */
+  installed(): Promise<boolean> {
+    return exists(join(this.clientDir, "wechat"));
+  }
+
+  /** The bridge's home: its keys file and its decrypted copies of the store,
+   *  both private to the runtime user. */
+  get bridgeHome(): string {
+    return join(this.prefix, "bridge");
   }
 
   get keysFile(): string {
-    return join(this.home, ".wechat-cli", "all_keys.json");
+    return join(this.bridgeHome, "keys.json");
   }
 
   /** The cached account store directory, or null when no store exists. */
@@ -340,6 +466,18 @@ export class WechatUserRuntime {
     return null;
   }
 
+  /** The X display a new client starts on. Fixed for the runtime's life: a
+   *  running client's own display comes from `status()` or `clientDisplay()`,
+   *  and queries never change this. */
+  get display(): string {
+    return this.startDisplay;
+  }
+
+  /** The page that shows `display` to the guardian, for sign-in links. */
+  desktopPathFor(display: string): string {
+    return this.desktop && display === this.desktop.display ? "/desktop/wechat" : "/desktop";
+  }
+
   /** This dedicated container owns one WeChat client. Match its process name
    *  because ordinary and debugger launches can use different executable paths. */
   async pid(): Promise<number | null> {
@@ -347,6 +485,78 @@ export class WechatUserRuntime {
     const first = (found?.stdout ?? "").split("\n")[0]?.trim();
     const pid = first ? Number(first) : Number.NaN;
     return Number.isInteger(pid) && pid > 0 ? pid : null;
+  }
+
+  /**
+   * The display the client with this pid runs on: its own `DISPLAY`, else the
+   * start display. A client already on another display keeps it, because moving
+   * it would mean a restart, which can make the phone confirm again. It moves
+   * only when it next starts.
+   */
+  async clientDisplay(pid: number): Promise<string> {
+    if (!this.desktop) return this.startDisplay;
+    const environ = await readFile(join(this.procDir, String(pid), "environ"), "utf8").catch(
+      () => null,
+    );
+    const entry = environ?.split("\0").find((line) => line.startsWith("DISPLAY="));
+    return entry?.slice("DISPLAY=".length) || this.startDisplay;
+  }
+
+  /**
+   * Start whatever part of WeChat's own desktop has died under a running client
+   * on it, such as a crashed websockify that leaves /desktop/wechat broken.
+   * Does nothing for a client on another display. Never throws: a repair that
+   * fails is logged, and the client keeps running.
+   */
+  async repairDesktop(signal?: AbortSignal): Promise<void> {
+    const pid = await this.pid();
+    if (!this.desktop || !pid || (await this.clientDisplay(pid)) !== this.desktop.display) return;
+    try {
+      await this.ensureDesktop(signal);
+    } catch (error) {
+      log.warn("wechat_user.desktop_repair_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Start WeChat's own desktop, or reuse it, before a client starts on it. The
+   * desktop outlives Rome, so a Rome restart finds it running. Where the start
+   * script is not installed, as on a host `pnpm start`, the client stays on the
+   * shared desktop. Throws WechatUserRuntimeError when the desktop cannot start.
+   *
+   * Resolves to the display a new client should start on: `display`, or the
+   * shared one where the script is missing. It changes no runtime state, so a
+   * repair under a running client cannot move where anything else looks.
+   */
+  async ensureDesktop(signal?: AbortSignal): Promise<string> {
+    const desktop = this.desktop;
+    if (!desktop) return this.startDisplay;
+    if (!(await exists(this.desktopScript))) {
+      log.warn("wechat_user.desktop_unavailable", { script: this.desktopScript });
+      return sharedDisplay();
+    }
+    // env -i: the desktop's programs outlive Rome and need none of its
+    // configuration or credentials. ROME_DESKTOP_LOG_DIR passes through so an
+    // operator's override applies to every run, which then share one lock.
+    const env = [
+      `ROME_DESKTOP_LOCK_WAIT=${DESKTOP_LOCK_WAIT_S}`,
+      ...["PATH", "HOME", "USER", "LOGNAME", "LANG", "ROME_DESKTOP_LOG_DIR"].flatMap((key) =>
+        process.env[key] === undefined ? [] : [`${key}=${process.env[key]}`],
+      ),
+    ];
+    const result = await this.run(
+      "env",
+      ["-i", ...env, "bash", this.desktopScript, ...startDesktopArgs("wechat", desktop)],
+      { timeoutMs: DESKTOP_START_TIMEOUT_MS, ...(signal ? { signal } : {}) },
+    );
+    if (result.code !== 0) {
+      throw new WechatUserRuntimeError(
+        `Could not start WeChat's desktop: ${result.stderr.trim() || `exit ${result.code}`}`,
+      );
+    }
+    return desktop.display;
   }
 
   /**
@@ -360,8 +570,8 @@ export class WechatUserRuntime {
    * the desktop link for that.) The capture runs against the container's own
    * display and needs no privilege.
    */
-  async captureLoginQr(): Promise<string | null> {
-    const env = { DISPLAY: this.display };
+  async captureLoginQr(display: string = this.startDisplay): Promise<string | null> {
+    const env = { DISPLAY: display };
     const tree = await this.run("xwininfo", ["-root", "-tree"], { env }).catch(() => null);
     if (!tree || tree.code !== 0) return null;
     const windowId = loginWindowId(tree.stdout);
@@ -376,9 +586,9 @@ export class WechatUserRuntime {
     return `data:image/png;base64,${encoded}`;
   }
 
-  private async hasLoginWindow(): Promise<boolean> {
+  private async hasLoginWindow(display: string): Promise<boolean> {
     const tree = await this.run("xwininfo", ["-root", "-tree"], {
-      env: { DISPLAY: this.display },
+      env: { DISPLAY: display },
     });
     if (tree.code !== 0) {
       throw new WechatUserRuntimeError("Could not inspect the WeChat desktop session.");
@@ -386,7 +596,7 @@ export class WechatUserRuntime {
     const windowId = loginWindowId(tree.stdout);
     if (!windowId) return false;
     const window = await this.run("xwininfo", ["-id", windowId, "-stats", "-size"], {
-      env: { DISPLAY: this.display },
+      env: { DISPLAY: display },
     });
     // Login can destroy the window between the tree snapshot and this lookup.
     if (window.code !== 0) return false;
@@ -398,26 +608,23 @@ export class WechatUserRuntime {
   }
 
   async status(): Promise<WechatUserStatus> {
-    const installed = await exists(join(this.clientDir, "wechat"));
+    const installed = await this.installed();
     const pid = installed ? await this.pid() : null;
+    const scriptInstalled = this.desktop ? await exists(this.desktopScript) : false;
+    // A stopped client reports where it will start: the shared display where
+    // the start script is missing, as ensureDesktop() falls back to.
+    const display = pid
+      ? await this.clientDisplay(pid)
+      : this.desktop && !scriptInstalled
+        ? sharedDisplay()
+        : this.startDisplay;
     const account = installed ? await this.accountDir() : null;
-    let keysReady = false;
-    if (account !== null && (await exists(this.keysFile))) {
-      try {
-        const checked = z
-          .object({ keysReady: z.literal(true) })
-          .parse(await this.readerCommand(["check"]));
-        keysReady = checked.keysReady;
-      } catch (error) {
-        if (!isWechatUserSessionRejected(error) && !(error instanceof WechatUserStorePending))
-          throw error;
-      }
-    }
+    const keysReady = account !== null && (await this.missingKeys(account)) === null;
 
     let state: WechatUserState;
     if (!installed) state = "absent";
     else if (!pid) state = "stopped";
-    else if (await this.hasLoginWindow()) state = "awaiting-scan";
+    else if (await this.hasLoginWindow(display)) state = "awaiting-scan";
     else if (keysReady) state = "ready";
     else if (account) state = "awaiting-keys";
     else state = "starting";
@@ -430,6 +637,9 @@ export class WechatUserRuntime {
       keysReady,
       ...(account ? { wxid: account.split("/").pop() ?? undefined } : {}),
       ...(pid ? { pid } : {}),
+      display,
+      desktopPath: this.desktopPathFor(display),
+      movePending: Boolean(pid && this.desktop && scriptInstalled && display === sharedDisplay()),
     };
   }
 
@@ -442,18 +652,30 @@ export class WechatUserRuntime {
    * resolves its own resources against `/opt/wechat` regardless of where it
    * was started from.
    */
-  async install(signal?: AbortSignal): Promise<void> {
+  install(signal?: AbortSignal): Promise<void> {
+    // The WeChat app and the connection's setup both install. One download and
+    // unpack owns the client's files until it completes; a second caller joins
+    // it. A caller's signal stops only its own wait, so cancelling one caller
+    // never fails another's install, and the download finishes in the background.
+    // A caller already cancelled starts nothing.
+    if (signal?.aborted && !this.installing) return Promise.reject(signal.reason);
+    this.installing ??= this.installClient().finally(() => {
+      this.installing = null;
+    });
+    return signal ? untilAborted(this.installing, signal) : this.installing;
+  }
+
+  private async installClient(): Promise<void> {
     const deb = join(this.prefix, "wechat.deb");
     const clientRoot = join(this.prefix, "client");
     await mkdir(this.prefix, { recursive: true });
 
     if (!(await exists(join(this.clientDir, "wechat")))) {
-      await this.fetchClientArchive(deb, signal);
+      await this.fetchClientArchive(deb);
       log.info("wechat_user.unpacking_client", { prefix: clientRoot });
       await mkdir(clientRoot, { recursive: true });
       const unpacked = await this.run("dpkg-deb", ["-x", deb, clientRoot], {
         timeoutMs: INSTALL_TIMEOUT_MS,
-        ...(signal ? { signal } : {}),
       });
       if (unpacked.code !== 0) {
         throw new WechatUserRuntimeError(
@@ -479,9 +701,9 @@ export class WechatUserRuntime {
    * read the archive for, so it neither downloads a missing one nor hashes the
    * better part of a gigabyte to prove one it will not open.
    */
-  private async fetchClientArchive(path: string, signal?: AbortSignal): Promise<void> {
+  private async fetchClientArchive(path: string): Promise<void> {
     if (await exists(path)) {
-      const digest = await this.clientDigest(path, signal);
+      const digest = await this.clientDigest(path);
       if (digest === WECHAT_CLIENT_SHA256) return;
       log.warn("wechat_user.cached_client_rejected", {
         path,
@@ -495,7 +717,7 @@ export class WechatUserRuntime {
     const downloaded = await this.run(
       "curl",
       ["-fsSL", "--retry", "3", "-o", `${path}.part`, WECHAT_CLIENT_URL],
-      { timeoutMs: INSTALL_TIMEOUT_MS, ...(signal ? { signal } : {}) },
+      { timeoutMs: INSTALL_TIMEOUT_MS },
     );
     if (downloaded.code !== 0) {
       throw new WechatUserRuntimeError(
@@ -503,7 +725,7 @@ export class WechatUserRuntime {
       );
     }
 
-    const digest = await this.clientDigest(`${path}.part`, signal);
+    const digest = await this.clientDigest(`${path}.part`);
     if (digest !== WECHAT_CLIENT_SHA256) {
       await this.discard(`${path}.part`);
       throw new WechatUserRuntimeError(
@@ -542,10 +764,8 @@ export class WechatUserRuntime {
    * here rather than reporting a mismatch keeps a `sha256sum` that never
    * answered from evicting a cached archive that was the right build all along.
    */
-  private async clientDigest(path: string, signal?: AbortSignal): Promise<string> {
-    const checksum = await this.run("sha256sum", [path], {
-      ...(signal ? { signal } : {}),
-    });
+  private async clientDigest(path: string): Promise<string> {
+    const checksum = await this.run("sha256sum", [path]);
     if (checksum.code !== 0) {
       throw new WechatUserRuntimeError(
         `Could not checksum the WeChat client at ${path}: ` +
@@ -576,9 +796,9 @@ export class WechatUserRuntime {
 
   /** The environment the client needs. Established empirically; the client
    *  faults or draws nothing without these. */
-  private clientEnv(): Record<string, string> {
+  private clientEnv(display: string = this.startDisplay): Record<string, string> {
     return {
-      DISPLAY: this.display,
+      DISPLAY: display,
       HOME: this.home,
       QT_QPA_PLATFORM: "xcb",
       LIBGL_ALWAYS_SOFTWARE: "1",
@@ -644,10 +864,14 @@ export class WechatUserRuntime {
   }
 
   private async startClient(signal?: AbortSignal): Promise<void> {
+    if (this.captureInProgress) return;
     if (await this.pid()) return;
     if (signal?.aborted) throw signal.reason;
+    const display = await this.ensureDesktop(signal);
     await this.ensureClientLink();
     await this.prepareSession();
+    // A capture can take the lease during the steps above; it owns the launch.
+    if (this.captureInProgress) return;
 
     const started = await this.run(
       "sh",
@@ -658,99 +882,513 @@ export class WechatUserRuntime {
         this.canonicalPrefix,
         join(this.prefix, "client.log"),
       ],
-      { env: this.clientEnv(), ...(signal ? { signal } : {}) },
+      { env: this.clientEnv(display), ...(signal ? { signal } : {}) },
     );
     if (started.code !== 0) {
       throw new WechatUserRuntimeError(
         `Could not start the WeChat client: ${started.stderr.trim() || "spawn failed"}`,
       );
     }
-    log.info("wechat_user.client_started", { display: this.display });
+    log.info("wechat_user.client_started", { display });
   }
 
   async stop(): Promise<void> {
     await this.run("pkill", ["-x", "wechat"]).catch(() => {});
   }
 
-  /** Install the reader's python dependencies into the volume. */
-  async installReader(signal?: AbortSignal): Promise<void> {
-    if (await exists(join(this.venvDir, "bin", "python3"))) return;
-    const created = await this.run("python3", ["-m", "venv", this.venvDir], {
-      timeoutMs: INSTALL_TIMEOUT_MS,
-      ...(signal ? { signal } : {}),
-    });
-    if (created.code !== 0) {
-      throw new WechatUserRuntimeError(
-        `Could not create the reader environment: ${created.stderr.trim()}`,
+  /**
+   * Capture the store keys with the bridge's `init`. It relaunches the client
+   * under gdb on `display`, waits for a login to unlock the store, and writes
+   * the keys file reads use. Throws {@link WechatUserStorePending} when the
+   * client had not created every message database yet: the bridge keeps no
+   * passphrase, so only another capture can key the rest.
+   */
+  async captureKeys(display: string, signal?: AbortSignal): Promise<void> {
+    // The bridge writes the raw passphrase under TMPDIR and removes it only
+    // when it exits cleanly, so point TMPDIR at a private directory and clear
+    // the bridge's capture files from it afterwards. The client launched under
+    // gdb inherits TMPDIR, so the directory itself stays.
+    const tmp = join(this.runtimeDir, CAPTURE_TMP_DIR);
+    await mkdir(tmp, { recursive: true, mode: 0o700 });
+    let captured = false;
+    try {
+      initResultSchema.parse(
+        await this.bridge(["init", "--wait", String(CAPTURE_WAIT_SECONDS)], {
+          env: { ...this.clientEnv(display), TMPDIR: tmp },
+          timeoutMs: (CAPTURE_WAIT_SECONDS + CAPTURE_GRACE_SECONDS) * 1000,
+          ...(signal ? { signal } : {}),
+        }),
       );
+      captured = true;
+    } finally {
+      // Killing the bridge early leaves its gdb holding the client, which then
+      // never exits. Nothing else in this container runs gdb.
+      if (!captured) await this.run("pkill", ["-x", "gdb"]).catch(() => {});
+      for (const name of await readdir(tmp).catch(() => [] as string[])) {
+        if (name.startsWith(BRIDGE_CAPTURE_PREFIX)) {
+          await rm(join(tmp, name), { recursive: true, force: true });
+        }
+      }
     }
-    const installed = await this.run(
-      join(this.venvDir, "bin", "pip"),
-      ["install", "--quiet", WECHAT_CLI_SOURCE],
-      { timeoutMs: INSTALL_TIMEOUT_MS, ...(signal ? { signal } : {}) },
-    );
-    if (installed.code !== 0) {
-      throw new WechatUserRuntimeError(
-        `Could not install the reader's dependencies: ${installed.stderr.trim()}`,
+    this.keysCheckedAt = 0;
+    const account = await this.accountDir();
+    const missing = account ? await this.missingKeys(account) : ["the account store"];
+    if (missing) {
+      throw new WechatUserStorePending(
+        `WeChat had not finished creating ${missing.join(", ")} when it signed in.`,
       );
     }
   }
 
   /**
-   * Run the reader helper. The helper owns everything that needs WeChat's own
-   * file formats — SQLCipher page decryption, zstd message bodies, the rich
-   * message envelopes — and answers plain JSON.
+   * The required databases the stored keys do not fit, or null when they fit
+   * them all: the session and contact lists the bridge opens, and every
+   * message shard, of which there must be one. The bridge skips a shard it
+   * holds no key for, so without this a shard created after the capture reads
+   * as a chat with less history rather than as a locked store. A key fits when
+   * it was derived for the salt the database now starts with, so a database
+   * the client recreated reads as locked too.
    */
-  async readerCommand(args: string[], signal?: AbortSignal): Promise<unknown> {
-    const result = await this.run(join(this.venvDir, "bin", "python3"), [helperPath(), ...args], {
-      env: { HOME: this.home },
-      timeoutMs: 5 * 60_000,
-      ...(signal ? { signal } : {}),
+  private async missingKeys(accountDir: string): Promise<string[] | null> {
+    const dbDir = join(accountDir, "db_storage");
+    let stored: z.infer<typeof storedKeysSchema>;
+    try {
+      stored = storedKeysSchema.parse(JSON.parse(await readFile(this.keysFile, "utf8")));
+    } catch {
+      return ["the keys file"];
+    }
+    if (stored.dbDir !== dbDir) return ["this account's keys"];
+    const shards = (await readdir(join(dbDir, "message")).catch(() => [] as string[]))
+      .filter((name) => /^message_\d+\.db$/.test(name))
+      .map((name) => `message/${name}`);
+    // A keyed shard the client has since deleted fails every query the bridge
+    // runs over it, so it counts as required too.
+    const keyed = Object.keys(stored.keys).filter((rel) => /^message\/message_\d+\.db$/.test(rel));
+    const required = [
+      ...new Set(["session/session.db", "contact/contact.db", ...shards, ...keyed]),
+    ];
+    const missing: string[] = shards.length === 0 ? ["message/message_0.db"] : [];
+    for (const rel of required) {
+      const salt = await fileSalt(join(dbDir, rel));
+      if (!salt || stored.keys[rel]?.salt !== salt) missing.push(rel);
+    }
+    return missing.length > 0 ? missing : null;
+  }
+
+  /** Refuse reads while the stored keys miss a required database. */
+  private async checkKeys(): Promise<void> {
+    if (Date.now() - this.keysCheckedAt < KEYS_CHECK_TTL_MS) return;
+    const account = await this.accountDir();
+    if (!account) throw new WechatUserSessionRejected("The WeChat account is signed out.");
+    const missing = await this.missingKeys(account);
+    if (missing) {
+      throw new WechatUserSessionRejected(
+        `The WeChat message store is locked: no key for ${missing.join(", ")}.`,
+      );
+    }
+    this.keysCheckedAt = Date.now();
+  }
+
+  /**
+   * Run one `wechat-cli` command against this container's client and store,
+   * answering the envelope's data. The bridge owns everything that needs
+   * WeChat's own file formats. Its error codes map onto the reader's faults:
+   * no keys (or keys for another account) is a rejected session, a store the
+   * client is mid-write on is pending, and anything else is transient.
+   */
+  async bridgeCommand(args: string[], signal?: AbortSignal): Promise<unknown> {
+    // One bridge process at a time: the bridge's decrypt cache has no
+    // cross-process lock, so concurrent processes each decrypt the same shards
+    // and can leave an older copy marked current.
+    const turn = this.bridgeQueue.then(() => {
+      signal?.throwIfAborted();
+      return this.runBridge(args, signal);
+    });
+    this.bridgeQueue = turn.catch(() => {});
+    return turn;
+  }
+
+  private async runBridge(args: string[], signal?: AbortSignal): Promise<unknown> {
+    await this.checkKeys();
+    return this.bridge(args, { timeoutMs: 5 * 60_000, ...(signal ? { signal } : {}) });
+  }
+
+  private async bridge(args: string[], opts: RunOptions): Promise<unknown> {
+    const result = await this.run(process.execPath, [bridgeEntry(), "-f", "json", ...args], {
+      ...opts,
+      env: {
+        ...opts.env,
+        HOME: this.home,
+        WECHAT_CLI_HOME: this.bridgeHome,
+        WECHAT_DATA_ROOT: join(this.home, "xwechat_files"),
+        WECHAT_APP_BINARY: join(this.canonicalPrefix, "wechat"),
+      },
     }).catch((error: unknown) => {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        throw new WechatUserSessionRejected("The WeChat reader has not been installed yet.");
+      if ((error as { code?: unknown }).code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+        throw new WechatBridgeError(OUTPUT_TOO_LARGE, "the answer exceeded the output limit");
       }
       throw error;
     });
-    if (result.code === 3) {
-      throw new WechatUserSessionRejected(
-        result.stderr.trim() || "The WeChat account is signed out, or its key no longer fits.",
-      );
-    }
-    if (result.code === 4) {
-      throw new WechatUserStorePending(
-        result.stderr.trim() || "The WeChat store is not ready yet.",
-      );
-    }
-    if (result.code !== 0) {
-      throw new WechatUserRuntimeError(
-        `The WeChat reader failed: ${result.stderr.trim() || `exit ${result.code}`}`,
-      );
-    }
+    let envelope: z.infer<typeof bridgeEnvelopeSchema>;
     try {
-      return JSON.parse(result.stdout);
+      envelope = bridgeEnvelopeSchema.parse(JSON.parse(result.stdout));
     } catch (error) {
       throw new WechatUserRuntimeError(
-        `The WeChat reader returned unparseable JSON: ${error instanceof Error ? error.message : String(error)}`,
+        `The WeChat reader failed: ${result.stderr.trim() || (error instanceof Error ? error.message : `exit ${result.code}`)}`,
       );
     }
+    if (envelope.ok) return envelope.data;
+    const { code, message } = envelope.error;
+    switch (code) {
+      case "KEY_NOT_FOUND":
+      case "WECHAT_NOT_FOUND":
+        throw new WechatUserSessionRejected(message);
+      case "DECRYPT_FAILED":
+        throw new WechatUserStorePending(message);
+      default:
+        throw new WechatBridgeError(code, message);
+    }
+  }
+}
+
+/** How long a successful key check covers later reads. */
+const KEYS_CHECK_TTL_MS = 30_000;
+
+/** The capture launches the client and waits for the guardian to scan and for
+ *  the login to unlock the store, so it needs room. */
+const CAPTURE_WAIT_SECONDS = 540;
+
+/** How much longer Rome waits before killing the capture, so the bridge's own
+ *  timeout fires first and reports why. */
+const CAPTURE_GRACE_SECONDS = 30;
+
+/** What `wechat-cli init` answers. `pending` lists the required databases the
+ *  login had not created yet, so no key covers them. */
+const initResultSchema = z.object({
+  state: z.enum(["ready", "pending"]),
+  missing: z.array(z.string()),
+});
+
+/** The captured client's TMPDIR, under the runtime directory. */
+const CAPTURE_TMP_DIR = "wechat-tmp";
+
+/** How the bridge names the temporary directory holding its passphrase file. */
+const BRIDGE_CAPTURE_PREFIX = "wechat-cli-capture-";
+
+/** The part of the bridge's keys file Rome checks before reads. */
+const storedKeysSchema = z.object({
+  dbDir: z.string(),
+  keys: z.record(
+    z.string(),
+    z.object({ encKey: z.string().regex(/^[0-9a-f]{64}$/i), salt: z.string() }),
+  ),
+});
+
+/** The SQLCipher salt a database starts with, as hex, or null before the
+ *  client has written it. */
+async function fileSalt(path: string): Promise<string | null> {
+  let handle;
+  try {
+    handle = await open(path, "r");
+    const salt = Buffer.alloc(16);
+    const { bytesRead } = await handle.read(salt, 0, 16, 0);
+    return bytesRead === 16 ? salt.toString("hex") : null;
+  } catch {
+    return null;
+  } finally {
+    await handle?.close();
+  }
+}
+
+/** The code the reader gives an answer too large to capture, so paged reads
+ *  can retry with smaller pages. */
+const OUTPUT_TOO_LARGE = "OUTPUT_TOO_LARGE";
+
+/** A `wechat-cli` failure the reader does not map onto a session fault. */
+class WechatBridgeError extends WechatUserRuntimeError {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(`The WeChat reader failed: ${message}`);
   }
 }
 
 // ── reader ────────────────────────────────────────────────────────────────
 
+/** How many recent chats a read across every conversation covers. Bounded on
+ *  purpose: sweeping every chat ever opened is minutes of work, and the caller
+ *  asked for a page. */
+const RECENT_CONVERSATIONS = 20;
+
+/** How long a chat's display name, read for messages that do not carry it,
+ *  is reused before the session list is read again. */
+const NAMES_TTL_MS = 60_000;
+
+/** The first page size for reading a whole second. A page whose answer
+ *  overflows the output limit is retried at half the size. */
+const TIES_PAGE = 200;
+
+/** A rich message's body is its whole serialized envelope, which is CDN keys
+ *  and AES material rather than anything anyone said. Keep what precedes it. */
+const ENVELOPE_MARKERS = ["<?xml", "<msg>", "<msg "];
+const MAX_TEXT = 4000;
+
+function cleanText(text: string): string {
+  let cut = text.length;
+  for (const marker of ENVELOPE_MARKERS) {
+    const found = text.indexOf(marker);
+    if (found !== -1) cut = Math.min(cut, found);
+  }
+  return text.slice(0, cut).trim().slice(0, MAX_TEXT);
+}
+
+function toUnixSeconds(iso: string): number {
+  return Math.floor(Date.parse(iso) / 1000);
+}
+
+function isoSeconds(date: Date): string {
+  return new Date(Math.floor(date.getTime() / 1000) * 1000).toISOString();
+}
+
+/** The folded entries (folded group chats, subscriptions) are rows in the
+ *  session list, not chats. */
+function isChat(session: BridgeSession): boolean {
+  return session.type !== "folded";
+}
+
+function toConversation(session: BridgeSession): WechatUserConversation {
+  // A group's preview is prefixed by its sender's id.
+  const preview = session.lastMessage?.content ?? "";
+  const createdAt = session.lastMessage?.createdAt;
+  return wechatUserConversationSchema.parse({
+    id: session.username,
+    name: session.displayName,
+    isGroup: session.type === "group",
+    unread: session.unread,
+    lastMessageAt: createdAt ? toUnixSeconds(createdAt) : null,
+    lastMessagePreview: preview.includes(":\n")
+      ? preview.split(":\n").slice(1).join(":\n")
+      : preview,
+  });
+}
+
+/**
+ * A bridge message in the reader's shape. A direct chat's message with no
+ * resolvable sender is the other party's. A non-text message the bridge
+ * renders as its raw envelope reads as a short placeholder, because a
+ * transcript that drops it silently misreads the conversation.
+ */
+function toMessage(
+  message: BridgeMessage,
+  conversationName: string | undefined,
+): WechatUserMessage {
+  const isGroup = message.sessionType === "group";
+  const senderId = message.sender || (isGroup ? "" : message.session);
+  const senderName = message.groupNickname || message.senderName;
+  return wechatUserMessageSchema.parse({
+    id: message.id,
+    conversationId: message.session,
+    ...(conversationName ? { conversationName } : {}),
+    isGroup,
+    senderId,
+    ...(senderName ? { senderName } : {}),
+    isSelf: message.isSelf,
+    timestamp: toUnixSeconds(message.createdAt),
+    type: message.type,
+    text: cleanText(message.content) || `[${message.type}]`,
+  });
+}
+
 /** Reads the signed-in account's own store. Every call is a live query: the
  *  client's SQLite is the record, so a Rome-side copy would only add staleness. */
 export class WechatUserReader {
+  private names: { at: number; byId: Promise<Map<string, string>> } | null = null;
+
   constructor(private readonly runtime: WechatUserRuntime) {}
+
+  /**
+   * Every chat, most recently active first, including chats hidden in the
+   * client's list, which still hold history. The bridge orders by the client's
+   * sort key, which puts pinned chats first however old, so the whole list is
+   * read and ordered by last message before any limit applies.
+   */
+  private async sessions(signal?: AbortSignal): Promise<BridgeSession[]> {
+    const data = await this.runtime.bridgeCommand(["sessions", "--include-hidden"], signal);
+    const lastAt = (session: BridgeSession) =>
+      session.lastMessage?.createdAt ? Date.parse(session.lastMessage.createdAt) : 0;
+    return z
+      .array(bridgeSessionSchema)
+      .parse(data)
+      .filter(isChat)
+      .sort((a, b) => lastAt(b) - lastAt(a));
+  }
 
   async conversations(
     input: { query?: string; limit: number },
     signal?: AbortSignal,
   ): Promise<WechatUserConversation[]> {
-    const args = ["conversations", "--limit", String(input.limit)];
-    if (input.query) args.push("--query", input.query);
-    return conversationsSchema.parse(await this.runtime.readerCommand(args, signal)).conversations;
+    const needle = input.query?.toLowerCase();
+    return (await this.sessions(signal))
+      .filter((session) => session.lastMessage?.createdAt)
+      .filter(
+        (session) =>
+          !needle ||
+          session.displayName.toLowerCase().includes(needle) ||
+          session.username.toLowerCase().includes(needle),
+      )
+      .slice(0, input.limit)
+      .map(toConversation);
+  }
+
+  /** Chat display names, which the bridge's messages do not carry. */
+  private conversationNames(signal?: AbortSignal): Promise<Map<string, string>> {
+    if (!this.names || Date.now() - this.names.at > NAMES_TTL_MS) {
+      const byId = this.sessions(signal).then(
+        (sessions) => new Map(sessions.map((session) => [session.username, session.displayName])),
+      );
+      byId.catch(() => {
+        this.names = null;
+      });
+      this.names = { at: Date.now(), byId };
+    }
+    return this.names.byId;
+  }
+
+  private async page(
+    conversationId: string,
+    window: { since?: Date; until?: Date; limit: number; cursor?: string },
+    signal?: AbortSignal,
+  ): Promise<z.infer<typeof bridgePageSchema>> {
+    const args = ["query", conversationId, "-n", String(window.limit)];
+    if (window.since) args.push("--since", isoSeconds(window.since));
+    if (window.until) args.push("--until", isoSeconds(window.until));
+    if (window.cursor) args.push("--cursor", window.cursor);
+    try {
+      return bridgePageSchema.parse(await this.runtime.bridgeCommand(args, signal));
+    } catch (error) {
+      if (error instanceof WechatBridgeError && error.code === "SESSION_NOT_FOUND") {
+        return { messages: [], cursor: null };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Every page of a chat's window, newest page first, each oldest first. A page
+   * too large to capture is asked for again at half the size, so long bodies
+   * slow a sweep down instead of failing it.
+   */
+  private async *pages(
+    conversationId: string,
+    window: { since?: Date; until?: Date },
+    limit: number,
+    signal?: AbortSignal,
+  ): AsyncGenerator<z.infer<typeof bridgePageSchema>> {
+    let cursor: string | null = null;
+    for (;;) {
+      let page: z.infer<typeof bridgePageSchema>;
+      try {
+        page = await this.page(
+          conversationId,
+          { ...window, limit, ...(cursor ? { cursor } : {}) },
+          signal,
+        );
+      } catch (error) {
+        if (error instanceof WechatBridgeError && error.code === OUTPUT_TOO_LARGE && limit > 1) {
+          limit = Math.ceil(limit / 2);
+          continue;
+        }
+        throw error;
+      }
+      yield page;
+      if (!page.cursor) return;
+      cursor = page.cursor;
+    }
+  }
+
+  /**
+   * A chat's newest `limit` messages in a window, oldest first, read through
+   * {@link pages} so long bodies split the read instead of failing it. `more`
+   * says whether older messages remain.
+   */
+  private async newest(
+    conversationId: string,
+    window: { since?: Date; until?: Date },
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<{ messages: BridgeMessage[]; more: boolean }> {
+    const messages: BridgeMessage[] = [];
+    let more = false;
+    for await (const page of this.pages(conversationId, window, limit, signal)) {
+      messages.unshift(...page.messages);
+      more = page.cursor !== null;
+      if (messages.length >= limit) break;
+    }
+    if (messages.length > limit) more = true;
+    return { messages: messages.slice(-limit), more };
+  }
+
+  /** Every message a chat holds in the second starting at `at`, oldest first. */
+  private async second(
+    conversationId: string,
+    at: Date,
+    signal?: AbortSignal,
+  ): Promise<BridgeMessage[]> {
+    const messages: BridgeMessage[] = [];
+    for await (const page of this.pages(
+      conversationId,
+      { since: at, until: at },
+      TIES_PAGE,
+      signal,
+    )) {
+      messages.unshift(...page.messages);
+    }
+    return messages;
+  }
+
+  /**
+   * One chat's newest `limit` messages at or after `since` and at or before
+   * `before`, oldest first.
+   *
+   * With `includeBoundaryTies` the window is for paging by timestamp: every
+   * message in the `before` second, plus the newest `limit` strictly older
+   * ones with every tie at their oldest second. A second holding more than
+   * `limit` messages then cannot stall the caller's paging on itself.
+   */
+  private async chatMessages(
+    conversationId: string,
+    input: { since?: Date; before?: Date; limit: number; includeBoundaryTies?: boolean },
+    signal?: AbortSignal,
+  ): Promise<BridgeMessage[]> {
+    const since = input.since ? { since: input.since } : {};
+    if (!input.includeBoundaryTies) {
+      const window = { ...since, ...(input.before ? { until: input.before } : {}) };
+      return (await this.newest(conversationId, window, input.limit, signal)).messages;
+    }
+
+    const sinceSecond = input.since ? toUnixSeconds(input.since.toISOString()) : null;
+    const beforeSecond = input.before ? toUnixSeconds(input.before.toISOString()) : null;
+    let older: BridgeMessage[] = [];
+    if (beforeSecond === null || sinceSecond === null || beforeSecond - 1 >= sinceSecond) {
+      const until = beforeSecond === null ? {} : { until: new Date((beforeSecond - 1) * 1000) };
+      const page = await this.newest(conversationId, { ...since, ...until }, input.limit, signal);
+      older = page.messages;
+      const edge = older[0];
+      // With older history left, the oldest second may continue past the page.
+      if (edge && page.more) {
+        const edgeSecond = toUnixSeconds(edge.createdAt);
+        older = [
+          ...(await this.second(conversationId, new Date(edgeSecond * 1000), signal)),
+          ...older.filter((message) => toUnixSeconds(message.createdAt) !== edgeSecond),
+        ];
+      }
+    }
+    const atBefore =
+      beforeSecond !== null && (sinceSecond === null || beforeSecond >= sinceSecond)
+        ? await this.second(conversationId, new Date(beforeSecond * 1000), signal)
+        : [];
+    return [...older, ...atBefore];
   }
 
   async messages(
@@ -763,25 +1401,36 @@ export class WechatUserReader {
     },
     signal?: AbortSignal,
   ): Promise<WechatUserMessage[]> {
-    const args = ["messages", "--limit", String(input.limit)];
-    if (input.includeBoundaryTies) args.push("--include-boundary-ties");
-    if (input.conversationId) args.push("--conversation", input.conversationId);
-    if (input.since) args.push("--since", String(Math.floor(input.since.getTime() / 1000)));
-    if (input.before) args.push("--before", String(Math.floor(input.before.getTime() / 1000)));
-    return messagesSchema.parse(await this.runtime.readerCommand(args, signal)).messages;
-  }
-
-  /** Total messages, including placeholders for undecodable bodies. */
-  async count(conversationId: string, signal?: AbortSignal): Promise<number> {
-    const parsed = countSchema.parse(
-      await this.runtime.readerCommand(["count", "--conversation", conversationId], signal),
+    const names = await this.conversationNames(signal).catch(() => new Map<string, string>());
+    if (input.conversationId) {
+      const messages = await this.chatMessages(input.conversationId, input, signal);
+      return messages.map((message) => toMessage(message, names.get(message.session)));
+    }
+    // No chat named: read across the most recently active ones.
+    const recent = (await this.sessions(signal)).slice(0, RECENT_CONVERSATIONS);
+    const window = {
+      ...(input.since ? { since: input.since } : {}),
+      ...(input.before ? { before: input.before } : {}),
+      limit: input.limit,
+    };
+    const perChat = await Promise.all(
+      recent.map((session) => this.chatMessages(session.username, window, signal)),
     );
-    return parsed.count;
+    return perChat
+      .flat()
+      .map((message) => toMessage(message, names.get(message.session)))
+      .sort((a, b) => a.timestamp - b.timestamp)
+      .slice(-input.limit);
   }
-}
 
-/** Read the helper source, so callers that stage it elsewhere
- *  do not each re-derive where it lives. */
-export function readHelperSource(): Promise<string> {
-  return readFile(helperPath(), "utf8");
+  /** Total messages in a chat. The bridge counts rows without reading them. */
+  async count(conversationId: string, signal?: AbortSignal): Promise<number> {
+    try {
+      const data = await this.runtime.bridgeCommand(["count", conversationId], signal);
+      return bridgeCountSchema.parse(data).count;
+    } catch (error) {
+      if (error instanceof WechatBridgeError && error.code === "SESSION_NOT_FOUND") return 0;
+      throw error;
+    }
+  }
 }

@@ -67,11 +67,6 @@ rs.mock("@/shell/AppGrid", () => ({
 
 beforeAll(async () => {
   await i18n.changeLanguage("en");
-  // Radix menu + dialog poke pointer-capture and scrollIntoView, which jsdom omits.
-  Element.prototype.hasPointerCapture = () => false;
-  Element.prototype.setPointerCapture = () => {};
-  Element.prototype.releasePointerCapture = () => {};
-  Element.prototype.scrollIntoView = () => {};
   // Radix tooltip arrows measure themselves with ResizeObserver, also absent.
   class TestResizeObserver implements ResizeObserver {
     observe(): void {}
@@ -236,13 +231,15 @@ function LocationProbe() {
 }
 
 describe("AppsIndexPage reactivity", () => {
-  it("starts an update chat in the app's remembered source project", async () => {
+  it("chats with an app in its source project, beside the app", async () => {
     const user = userEvent.setup();
     mockBackend({
       installed: [
         installedCard({
           id: "weather",
           displayName: "Weather",
+          hasFrontend: true,
+          href: "/apps/weather",
           source: { mode: "source", path: "/projects/apps/weather" },
           projectPath: "apps/weather",
         }),
@@ -252,14 +249,43 @@ describe("AppsIndexPage reactivity", () => {
     renderPage();
 
     await user.click(await screen.findByLabelText("More actions for Weather"));
-    await user.click(await screen.findByRole("menuitem", { name: "Start chat here" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Chat with app" }));
 
     expect(screen.getByTestId("location").textContent).toBe(
-      JSON.stringify({ pathname: "/chat", state: { projectPath: "apps/weather" } }),
+      JSON.stringify({
+        pathname: "/chat",
+        state: { widgets: [{ type: "app", appId: "weather" }], projectPath: "apps/weather" },
+      }),
     );
   });
 
-  it("does not offer an update chat without a remembered source project", async () => {
+  it("chats beside an app that has no source project", async () => {
+    const user = userEvent.setup();
+    mockBackend({
+      installed: [
+        installedCard({
+          id: "weather",
+          displayName: "Weather",
+          hasFrontend: true,
+          href: "/apps/weather",
+        }),
+      ],
+    });
+
+    renderPage();
+
+    await user.click(await screen.findByLabelText("More actions for Weather"));
+    await user.click(await screen.findByRole("menuitem", { name: "Chat with app" }));
+
+    expect(screen.getByTestId("location").textContent).toBe(
+      JSON.stringify({
+        pathname: "/chat",
+        state: { widgets: [{ type: "app", appId: "weather" }] },
+      }),
+    );
+  });
+
+  it("offers no chat for an app with neither a page nor a source project", async () => {
     const user = userEvent.setup();
     mockBackend({
       installed: [installedCard({ id: "weather", displayName: "Weather" })],
@@ -268,7 +294,7 @@ describe("AppsIndexPage reactivity", () => {
     renderPage();
 
     await user.click(await screen.findByLabelText("More actions for Weather"));
-    expect(screen.queryByRole("menuitem", { name: "Start chat here" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Chat with app" })).toBeNull();
   });
 
   it("offers Remix only for an installed Store app whose local manifest includes source", async () => {
@@ -775,12 +801,12 @@ describe("AppsIndexPage tile interactions", () => {
 });
 
 describe("AppsIndexPage tile name tooltip", () => {
-  // jsdom performs no layout, so scrollWidth/clientWidth are both 0 and the
+  // jsdom performs no layout, so scrollHeight/clientHeight are both 0 and the
   // page's "is the label clipped?" probe reads false. Fake the geometry of a
   // clipped label on the name span to exercise the tooltip path.
   function fakeClippedLabel(el: HTMLElement) {
-    Object.defineProperty(el, "scrollWidth", { configurable: true, value: 180 });
-    Object.defineProperty(el, "clientWidth", { configurable: true, value: 84 });
+    Object.defineProperty(el, "scrollHeight", { configurable: true, value: 60 });
+    Object.defineProperty(el, "clientHeight", { configurable: true, value: 40 });
   }
 
   it("reveals the full name in a tooltip when hovering a tile whose name is clipped", async () => {

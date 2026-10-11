@@ -1,7 +1,6 @@
 import type { ReasoningEffort } from "./chat-types";
 
 export const DEFAULT_PROJECT_NAME = "default";
-export const SCROLL_BOTTOM_THRESHOLD_PX = 96;
 
 export const DEFAULT_LARGE_MODEL_SELECTION = "auto";
 export const LARGE_MODEL_OPTIONS = [
@@ -14,6 +13,7 @@ export const LARGE_MODEL_OPTIONS = [
   { id: "claude-haiku", labelKey: "modelSelector.options.haiku" },
   { id: "claude-fable", labelKey: "modelSelector.options.fable" },
   { id: "gpt-6-astra", labelKey: "modelSelector.options.gpt6Astra" },
+  { id: "gpt-6-1-sol", labelKey: "modelSelector.options.gpt61Sol" },
   { id: "gpt-6-sol", labelKey: "modelSelector.options.gpt6Sol" },
   { id: "gpt-6-luna", labelKey: "modelSelector.options.gpt6Luna" },
   { id: "gpt-5-6-sol", labelKey: "modelSelector.options.gpt56Sol" },

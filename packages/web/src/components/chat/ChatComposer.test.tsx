@@ -642,3 +642,94 @@ describe("programmatic draft insertion", () => {
     expect(focus).toHaveBeenCalled();
   });
 });
+
+describe("composer content height budget", () => {
+  it("shrinks long text when the attachment tray grows and restores it when cleared", () => {
+    let resizeTray: (() => void) | undefined;
+    let trayHeight = 0;
+    rs.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(private callback: () => void) {}
+        observe(target: HTMLElement) {
+          if (target.hasAttribute("data-attachment-tray")) {
+            rs.spyOn(target, "getBoundingClientRect").mockImplementation(
+              () => ({ height: trayHeight }) as DOMRect,
+            );
+            resizeTray = this.callback;
+          }
+        }
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    renderComposer({});
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    Object.defineProperty(textarea, "scrollHeight", { configurable: true, value: 600 });
+    fireEvent.input(textarea, { target: { value: "long draft\n".repeat(60) } });
+    expect(textarea.style.height).toBe("240px");
+    expect(resizeTray).toBeDefined();
+
+    trayHeight = 116;
+    act(() => resizeTray?.());
+    expect(textarea.style.height).toBe("124px");
+    expect(textarea.style.maxHeight).toBe("124px");
+    expect(textarea.style.overflowY).toBe("auto");
+    expect(textarea.value).toBe("long draft\n".repeat(60));
+
+    trayHeight = 0;
+    act(() => resizeTray?.());
+    expect(textarea.style.height).toBe("240px");
+    expect(textarea.style.maxHeight).toBe("240px");
+  });
+});
+
+// On a phone, a blurred textarea closes the soft keyboard. Sending must leave
+// focus where it was so the guardian can type the next turn straight away.
+describe("composer focus on send", () => {
+  it("keeps focus on the textarea when Send is pressed", () => {
+    const onSend = rs.fn().mockResolvedValue(undefined);
+    renderComposer({ onSend });
+
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    textarea.focus();
+    fireEvent.input(textarea, { target: { value: "hello" } });
+    const send = screen.getByRole("button", { name: /send/i });
+
+    fireEvent.pointerDown(send);
+    // fireEvent returns false when a handler cancelled the event.
+    expect(fireEvent.mouseDown(send)).toBe(false);
+    fireEvent.click(send);
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  it("refocuses the textarea when the press blurred it anyway", () => {
+    renderComposer({ onSend: rs.fn().mockResolvedValue(undefined) });
+
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    textarea.focus();
+    fireEvent.input(textarea, { target: { value: "hello" } });
+    const send = screen.getByRole("button", { name: /send/i });
+
+    fireEvent.pointerDown(send);
+    textarea.blur();
+    fireEvent.click(send);
+
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  it("does not pull focus into the textarea when it was not focused", () => {
+    renderComposer({ onSend: rs.fn().mockResolvedValue(undefined) });
+
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.input(textarea, { target: { value: "hello" } });
+    const send = screen.getByRole("button", { name: /send/i });
+
+    fireEvent.pointerDown(send);
+    fireEvent.click(send);
+
+    expect(document.activeElement).not.toBe(textarea);
+  });
+});

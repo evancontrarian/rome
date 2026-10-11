@@ -14,10 +14,6 @@ rs.mock("@/lib/shareable-origin", () => ({ shareableOrigin: () => origin.value }
 
 beforeAll(async () => {
   await i18n.changeLanguage("en");
-  Element.prototype.hasPointerCapture = () => false;
-  Element.prototype.setPointerCapture = () => {};
-  Element.prototype.releasePointerCapture = () => {};
-  Element.prototype.scrollIntoView = () => {};
 });
 
 afterEach(cleanup);
@@ -141,12 +137,32 @@ describe("the app access dialog", () => {
   describe("share link", () => {
     const SHARE_URL = "https://jessie.romeos.cc/full/apps/%40ray%2Fdemo";
     const shareLink = () => screen.queryByRole("textbox", { name: "Share link" });
+    // Saving reads then writes /api/public-access; both succeed with an empty
+    // config unless a test says otherwise.
+    let putAccess: (body: unknown) => Response;
+    let puts: unknown[] = [];
     // jsdom has no Clipboard API, and the copy button shows only where there is one.
     beforeEach(() => {
+      puts = [];
+      putAccess = () => new Response("{}", { status: 200 });
+      rs.stubGlobal(
+        "fetch",
+        rs.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input) !== "/api/public-access") return new Response("{}", { status: 404 });
+          if (init?.method !== "PUT") return new Response("{}", { status: 200 });
+          const body = JSON.parse(String(init.body));
+          puts.push(body);
+          return putAccess(body);
+        }),
+      );
       Object.defineProperty(navigator, "clipboard", {
         value: { writeText: async () => {} },
         configurable: true,
       });
+    });
+
+    afterEach(() => {
+      rs.unstubAllGlobals();
     });
 
     it("is absent while the app is private", async () => {
@@ -183,6 +199,66 @@ describe("the app access dialog", () => {
       expect(writeText).toHaveBeenCalledWith(SHARE_URL);
       expect(await screen.findByRole("button", { name: "Copied" })).toBeTruthy();
       expect(screen.queryByText("Save access before sharing this link.")).toBeNull();
+    });
+
+    it("stays open after saving a shared mode, with copy ready", async () => {
+      await openDialog();
+      await userEvent.click(screen.getByRole("radio", { name: /Public/ }));
+      await userEvent.click(screen.getByRole("button", { name: "Save access" }));
+
+      const copy = await screen.findByRole("button", { name: "Copy link" });
+      await waitFor(() => expect(copy.hasAttribute("disabled")).toBe(false));
+      expect(puts).toEqual([expect.objectContaining({ allowedApps: ["@ray/demo"] })]);
+      expect(screen.getByRole("radiogroup")).toBeTruthy();
+      expect(screen.queryByText("Save access before sharing this link.")).toBeNull();
+      expect(screen.getByRole("button", { name: "Done" })).toBeTruthy();
+      // Re-saving stays possible: it is the retry for a half-applied save.
+      expect(screen.getByRole("button", { name: "Save access" }).hasAttribute("disabled")).toBe(
+        false,
+      );
+    });
+
+    it("clears a failed save's error once a retry succeeds", async () => {
+      // The first save's PUT fails; the retry succeeds.
+      putAccess = () => {
+        putAccess = () => new Response("{}", { status: 200 });
+        throw new Error("Network down");
+      };
+      await openDialog();
+      await userEvent.click(screen.getByRole("radio", { name: /Public/ }));
+      await userEvent.click(screen.getByRole("button", { name: "Save access" }));
+      expect((await screen.findByRole("alert")).textContent).toBe("Network down");
+
+      await userEvent.click(screen.getByRole("button", { name: "Save access" }));
+
+      expect(await screen.findByRole("button", { name: "Done" })).toBeTruthy();
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
+
+    it("treats the saved email list in a new order as nothing to save", async () => {
+      await openDialog({
+        ...APP,
+        accessMode: "cloud-email",
+        cloudAllowedEmails: ["ada@example.com", "bob@example.com"],
+      } as InstalledAppCard);
+      await userEvent.click(screen.getByRole("button", { name: "Remove ada@example.com" }));
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+
+      const input = screen.getByLabelText(
+        i18n.t("installed.accessDialog.emailLabel", { ns: "apps" }),
+      );
+      await userEvent.type(input, "ada@example.com{Enter}");
+
+      expect(await screen.findByRole("button", { name: "Done" })).toBeTruthy();
+    });
+
+    it("closes after saving private, which has no link to copy", async () => {
+      await openDialog({ ...APP, accessMode: "public", isPublic: true } as InstalledAppCard);
+      await userEvent.click(screen.getByRole("radio", { name: /Private/ }));
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+      await userEvent.click(screen.getByRole("button", { name: "Save access" }));
+
+      await waitFor(() => expect(screen.queryByRole("radiogroup")).toBeNull());
     });
 
     it("offers no copy button where the browser has no clipboard", async () => {
@@ -292,8 +368,13 @@ describe("contact autocomplete in the email list", () => {
       "Ada Lovelaceada@example.com",
       "Adam Smithadam@example.com",
     ]);
-    // The server is asked with the term typed, once the debounce settles.
-    await waitFor(() => expect(requested.some((url) => url.includes("q=ada"))).toBe(true));
+    // The server is asked with the term typed, for email accounts alone, once
+    // the debounce settles.
+    await waitFor(() =>
+      expect(requested.some((url) => url.includes("q=ada") && url.includes("channel=email"))).toBe(
+        true,
+      ),
+    );
 
     await userEvent.click(options[1] as HTMLElement);
 
@@ -331,25 +412,6 @@ describe("contact autocomplete in the email list", () => {
     expect(options.map((o) => o.textContent)).toEqual(["Lady Byroncountess@example.org"]);
   });
 
-  it("asks the server for email accounts alone", async () => {
-    const input = await openCloudEmail();
-    await userEvent.type(input, "ada");
-    await screen.findAllByRole("option");
-    await waitFor(() =>
-      expect(requested.some((url) => url.includes("q=ada") && url.includes("channel=email"))).toBe(
-        true,
-      ),
-    );
-  });
-
-  it("searches a whole name, space and all", async () => {
-    const input = await openCloudEmail();
-    await userEvent.type(input, "adam smith");
-
-    const options = await screen.findAllByRole("option");
-    expect(options.map((o) => o.textContent)).toEqual(["Adam Smithadam@example.com"]);
-  });
-
   it("offers nothing for a term that only names the channel", async () => {
     const input = await openCloudEmail();
     await userEvent.type(input, "mail");
@@ -372,7 +434,9 @@ describe("contact autocomplete in the email list", () => {
   it("adds the first suggestion when Enter lands on a typed name", async () => {
     const input = await openCloudEmail();
     await userEvent.type(input, "adam smith");
-    await screen.findAllByRole("option");
+    // The whole name is the term, space and all.
+    const options = await screen.findAllByRole("option");
+    expect(options.map((o) => o.textContent)).toEqual(["Adam Smithadam@example.com"]);
 
     await userEvent.keyboard("{Enter}");
 
@@ -390,6 +454,8 @@ describe("contact autocomplete in the email list", () => {
 
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("option")).toBeNull());
+    // Escape closes only the suggestions, not the dialog around the field.
+    expect(screen.getByLabelText(emailLabel())).toBe(input);
     await userEvent.keyboard("{Enter}");
 
     // With no list showing, Enter commits the typed text, which is no address.
@@ -430,16 +496,5 @@ describe("contact autocomplete in the email list", () => {
 
     const options = await screen.findAllByRole("option");
     expect(options.map((o) => o.textContent)).toEqual(["Adam Smithadam@example.com"]);
-  });
-
-  it("closes the suggestions on Escape without closing the dialog", async () => {
-    const input = await openCloudEmail();
-    await userEvent.type(input, "ada");
-    await screen.findAllByRole("option");
-
-    await userEvent.keyboard("{Escape}");
-
-    await waitFor(() => expect(screen.queryByRole("option")).toBeNull());
-    expect(screen.getByLabelText(emailLabel())).toBe(input);
   });
 });

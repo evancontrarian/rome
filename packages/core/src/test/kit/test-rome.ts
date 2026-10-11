@@ -10,9 +10,13 @@ import type { Tracer } from "@opentelemetry/api";
 import {
   createTestDb,
   buildAgentConfig,
-  createMockTalkRouter,
-  mockChannelLookup,
+  channelNamed,
+  createTestConnections,
+  noAccounts,
+  type TestConnections,
 } from "../helpers.js";
+import type { Channels } from "../../channels/channel.js";
+import { channelList } from "../../channels/channel-list.js";
 import { FakeModel } from "./fake-model.js";
 import { FakeChannelEndpoint } from "./fake-channel.js";
 import type { DrizzleDb } from "../../db/index.js";
@@ -38,10 +42,11 @@ import { CapabilityDiscovery } from "../../core/capability-discovery.js";
 import { SkillCatalog } from "../../core/skill-catalog.js";
 import { AgentRunner } from "../../core/agent-runner.js";
 import type { RunParams } from "../../core/types.js";
-import type { TalkRouter } from "@rome-os/app-runtime";
-import type { AgentConfig, AgentMessage } from "../../types.js";
+import type { AgentConfig, AgentEvent } from "../../types.js";
 import type { Clock } from "../../lib/clock.js";
 import type { ActionSubprocessRunner } from "../../actions/action-subprocess.js";
+import { createEmptyLegacyArtifactBindings } from "../../apps/artifact-id.js";
+import { testChannelSurface } from "../channel-surface.js";
 
 // createTestRome — boot the real runtime wiring over an in-memory DB and a
 // temp profile, faking only genuine process edges (model provider, channel
@@ -113,11 +118,15 @@ export interface TestRome {
   agentLoader: AgentLoader;
   agentRunner: AgentRunner;
   approvalHandler: ApprovalHandler;
-  talkRouter: TalkRouter;
+  connections: TestConnections;
+  /** The channels over `connections`, built by the production `channelList`.
+   *  A test hears and answers a channel through its ports here, and plays the
+   *  platform's side through `channel(name)`. */
+  channels: Channels;
   seed: TestRomeSeed;
   channel(name: string): FakeChannelEndpoint;
   /** Run one agent turn through the real runner/session stack; collects messages. */
-  runAgent(params: Partial<RunParams> & { prompt: string }): Promise<AgentMessage[]>;
+  runAgent(params: Partial<RunParams> & { prompt: string }): Promise<AgentEvent[]>;
   cleanup(): Promise<void>;
 }
 
@@ -221,7 +230,8 @@ async function buildHarness(
       "utf-8",
     );
   }
-  const agentLoader = new AgentLoader();
+  const artifactIdentity = { legacyBindings: createEmptyLegacyArtifactBindings() };
+  const agentLoader = new AgentLoader(artifactIdentity);
   await agentLoader.loadAll(agentsDir);
 
   const model = new FakeModel();
@@ -239,7 +249,7 @@ async function buildHarness(
     },
   });
 
-  const actionRegistry = new ActionRegistryImpl([]);
+  const actionRegistry = new ActionRegistryImpl();
   for (const action of options.actions ?? []) {
     actionRegistry.register(action);
   }
@@ -248,11 +258,13 @@ async function buildHarness(
   // fork is the edge the kit avoids.
   const actionEngine = new ActionEngine(
     actionRegistry,
-    options.engine?.tracer,
-    repos.actionExecutions,
-    repos.approvals,
-    repos.executionJournal,
     {
+      executions: repos.actionExecutions,
+      approvals: repos.approvals,
+      journal: repos.executionJournal,
+    },
+    {
+      tracer: options.engine?.tracer,
       processRole: options.engine?.processRole ?? "worker",
       onApprovalCreated: options.engine?.onApprovalCreated,
       clock: options.engine?.clock,
@@ -260,12 +272,13 @@ async function buildHarness(
     },
   );
 
-  const sessionManager = new SessionManager(repos.sessions);
+  const sessionManager = new SessionManager(repos.sessions, artifactIdentity);
   const promptBuilder = new PromptBuilder();
   const agentSessionManager = createAgentSessionManager(
     {
       agentLoader,
       sessionManager,
+      sessionsRepo: repos.sessions,
       promptBuilder,
       actionRegistry,
       modelResolver,
@@ -273,8 +286,9 @@ async function buildHarness(
       // Real but inert collaborators: CapabilityDiscovery is never start()ed
       // (no timers, empty CDP map) and the dispatcher has no hooks loaded.
       capabilityDiscovery: new CapabilityDiscovery(),
-      skillCatalog: new SkillCatalog(),
+      skillCatalog: new SkillCatalog(artifactIdentity),
       lifecycleDispatcher: createAgentLifecycleDispatcher(),
+      channelSurface: testChannelSurface,
     },
     { keepAliveAcrossTurns: options.keepAliveAcrossTurns ?? false },
   );
@@ -284,11 +298,17 @@ async function buildHarness(
   for (const name of options.channels ?? ["telegram", "webchat"]) {
     channelEndpoints.set(name, new FakeChannelEndpoint(name));
   }
-  const talkRouter = createMockTalkRouter(channelEndpoints);
+  const connections = createTestConnections(channelEndpoints);
+  const channels = channelList({
+    db,
+    whatsAppAccounts: noAccounts,
+    linkedInAccounts: noAccounts,
+    connections: { registry: connections },
+  });
 
   const backendTurnRunner = createBackendTurnRunner({
     agentRunner,
-    channel: mockChannelLookup(talkRouter, channelEndpoints),
+    channel: channelNamed(channels),
   });
   const approvalHandler = new ApprovalHandler(
     repos.approvals,
@@ -309,7 +329,14 @@ async function buildHarness(
           typeof payload?.actionName === "string"
             ? `Execute ${payload.actionName}`
             : "test approval",
-        payload,
+        payload: payload && {
+          // The engine records the root call with every approval; a seed that
+          // names only the approved call is its own root, with nothing to replay.
+          rootActionName: payload.actionName,
+          rootArgs: payload.args,
+          replayJournal: [],
+          ...payload,
+        },
       }),
     approvedActionApproval: async (payload) => {
       const id = await seed.pendingActionApproval(payload);
@@ -330,7 +357,8 @@ async function buildHarness(
     agentLoader,
     agentRunner,
     approvalHandler,
-    talkRouter,
+    connections,
+    channels,
     seed,
     channel(name: string): FakeChannelEndpoint {
       const endpoint = channelEndpoints.get(name);
@@ -342,7 +370,7 @@ async function buildHarness(
       return endpoint;
     },
     async runAgent(params) {
-      const messages: AgentMessage[] = [];
+      const messages: AgentEvent[] = [];
       for await (const msg of agentRunner.run({ agentName: "main", ...params })) {
         messages.push(msg);
       }
