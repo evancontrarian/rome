@@ -47,7 +47,7 @@ caller ──install / uninstall / enable──► manager ──uses──► i
 - The manager owns every state transition: it is the sole lockfile writer and the sole trigger of catalog refresh.
 - The installer is pure materialization: source in, content-addressed bundle out. It knows nothing about the lockfile or the catalog, and it only ever receives packed bundles — the build step for a source install runs above it.
 - The catalog is the only read surface. Subscribers fire in registration order, sequentially, and must be idempotent: boot replays one event per app, and a re-install fires a second event for the same bundle.
-- A reinstall never leaves the app without a loaded bundle. The catalog keeps the previous bundle in the resolved set, in state `installing`, until the terminal refresh. The manager removes old bundle directories only after that refresh. A first install has no previous bundle, so its app joins the resolved set at the terminal refresh.
+- A reinstall keeps the app's previous bundle loaded until the install ends. The catalog keeps the previous bundle in the resolved set, in state `installing`, until the terminal refresh. The manager removes old bundle directories only after that refresh. A first install has no previous bundle, so its app joins the resolved set at the terminal refresh.
 - Subscriber order is load-bearing: agents load before the actions that reference them, and actions register before the hooks that depend on them.
 - Settled listeners run after every subscriber has handled an event, whatever order they registered in. They observe the runtime after the whole change has been absorbed.
 
