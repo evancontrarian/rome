@@ -169,18 +169,17 @@ export class AppCatalog {
 
     // A reinstall keeps the bundle it replaces loaded until the install ends,
     // so the app's agents, actions, skills, hooks, web and API stay available
-    // while the new bundle materializes. The manager garbage-collects the old
-    // bundle only after the terminal refresh swaps this view out.
+    // while the new bundle materializes. Every field except `state` and
+    // `updatedAt` describes that loaded bundle, even after the lockfile records
+    // the new hash. The manager garbage-collects the old bundle only after the
+    // terminal refresh swaps this view out.
     const previous = this.internalMap.get(appId);
-    if (
-      view.state === "installing" &&
-      view.enabled &&
-      isResolvedApp(previous) &&
-      previous.installedHash === view.installedHash
-    ) {
-      // `source` stays with the loaded bundle, so source, manifest and hash
-      // keep describing the same install.
-      const loaded: ResolvedApp = { ...previous, ...view, source: previous.source };
+    if (view.state === "installing" && view.enabled && isResolvedApp(previous)) {
+      const loaded: ResolvedApp = {
+        ...previous,
+        state: "installing",
+        updatedAt: view.updatedAt,
+      };
       this.internalMap.set(appId, loaded);
       await this.fireEvent({ appId, change: "changed", current: loaded });
       return;
