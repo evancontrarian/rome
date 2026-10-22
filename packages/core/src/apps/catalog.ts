@@ -178,7 +178,9 @@ export class AppCatalog {
       isResolvedApp(previous) &&
       previous.installedHash === view.installedHash
     ) {
-      const loaded: ResolvedApp = { ...previous, ...view };
+      // `source` stays with the loaded bundle, so source, manifest and hash
+      // keep describing the same install.
+      const loaded: ResolvedApp = { ...previous, ...view, source: previous.source };
       this.internalMap.set(appId, loaded);
       await this.fireEvent({ appId, change: "changed", current: loaded });
       return;

@@ -683,12 +683,19 @@ sideEffects: read-only
     }
 
     it("keeps the previous bundle and its agents loaded until the new bundle replaces it", async () => {
-      const first = await harness.appManager.install({ source: await agentBundle("one") });
+      const firstSource = await agentBundle("one");
+      const first = await harness.appManager.install({ source: firstSource });
       const seen = recordCatalogView();
+      const sources: unknown[] = [];
+      harness.catalog.subscribe(function recordSource(event) {
+        sources.push(event.current?.source);
+      });
 
-      const second = await harness.appManager.install({ source: await agentBundle("two") });
+      const secondSource = await agentBundle("two");
+      const second = await harness.appManager.install({ source: secondSource });
 
       expect(second.installedHash).not.toBe(first.installedHash);
+      expect(sources).toEqual([firstSource, secondSource]);
       expect(seen).toEqual([
         { state: "installing", bundle: first.installedHash, agents: [first.installedHash] },
         { state: "installed", bundle: second.installedHash, agents: [second.installedHash] },
