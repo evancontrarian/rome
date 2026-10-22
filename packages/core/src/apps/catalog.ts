@@ -76,10 +76,15 @@ export class AppCatalog {
     return Object.freeze([...this.internalMap.values()]);
   }
 
+  /** Apps whose bundle is loaded, including an app that keeps its bundle while it reinstalls. */
   listResolved(): readonly ResolvedApp[] {
     const out: ResolvedApp[] = [];
     for (const view of this.internalMap.values()) {
-      if (isResolvedApp(view) && view.state === "installed" && view.enabled) {
+      if (
+        isResolvedApp(view) &&
+        view.enabled &&
+        (view.state === "installed" || view.state === "installing")
+      ) {
         out.push(view);
       }
     }
@@ -161,6 +166,23 @@ export class AppCatalog {
     }
 
     const view = buildAppView(appId, entry, inFlight);
+
+    // A reinstall keeps the bundle it replaces loaded until the install ends,
+    // so the app's agents, actions, skills, hooks, web and API stay available
+    // while the new bundle materializes. The manager garbage-collects the old
+    // bundle only after the terminal refresh swaps this view out.
+    const previous = this.internalMap.get(appId);
+    if (
+      view.state === "installing" &&
+      view.enabled &&
+      isResolvedApp(previous) &&
+      previous.installedHash === view.installedHash
+    ) {
+      const loaded: ResolvedApp = { ...previous, ...view };
+      this.internalMap.set(appId, loaded);
+      await this.fireEvent({ appId, change: "changed", current: loaded });
+      return;
+    }
 
     if (view.state === "installed" && view.enabled) {
       const resolveResult = await this.installer.resolve(appId);
