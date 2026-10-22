@@ -141,7 +141,7 @@ The lifecycle operations apply apps to a profile: install, uninstall, and enable
 - Install is a completion barrier: when the call returns success, the new bundle is live and the runtime has finished reloading it. The caller never polls.
 - A reinstall keeps the previous bundle live until the install ends. The app's agents, actions, skills, hooks, web pages and API answer while the new bundle materializes. A failed reinstall unloads the app until a later install succeeds, because only installed entries load.
 - An invalid local source is rejected before any state is written. The declared install mode must agree with the observed directory shape, and a bundle missing a manifest-declared output is rejected up front. A healthy installed app cannot be flipped to failed by a bad install attempt.
-- A failed install preserves the previous state: the live bundle and the recorded hash and version stay unchanged. Only the failure fields move.
+- A failed install keeps the recorded hash and version, and the previous bundle stays on disk. Only the state and the failure fields move.
 - Uninstall always drops the lockfile entry, even when disk cleanup fails part-way. A later install of the same id recovers the disk state.
 - Dependency installation applies no minimum release age, so a bundle can consume an SDK published in the same release window.
 
